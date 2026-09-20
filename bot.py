@@ -313,9 +313,27 @@ async def analyze_with_groq(logs):
     if not logs.strip(): return "📭 Логи пустые, нечего анализировать."
     try:
         response = await groq_client.chat.completions.create(
-            messages=[{"role": "system", "content": "Ты опытный Python разработчик BotHost. Найди ошибку в логах. Отвечай кратко на русском в HTML: <b>❓ Проблема:</b> ... <b>📍 Где:</b> ... <b>💡 Решение:</b> ..."}, {"role": "user", "content": f"Лог:\n\n{logs[-2500:]}"}],
-            model="qwen/qwen3.8-27b", temperature=0.2
-        )
+    messages=[
+        {
+            "role": "system",
+            "content": (
+                "Ты опытный Python разработчик BotHost. "
+                "Найди ошибку в логах. "
+                "Отвечай кратко на русском в HTML: "
+                "<b>❓ Проблема:</b> ... "
+                "<b>📍 Где:</b> ... "
+                "<b>💡 Решение:</b> ..."
+            )
+        },
+        {
+            "role": "user",
+            "content": f"Лог:\n\n{logs[-2500:]}"
+        }
+    ],
+    model="qwen/qwen3.8-27b",
+    temperature=0.2,
+    max_tokens=400
+)
         return response.choices[0].message.content
     except Exception as e: return f"❌ Ошибка нейросети: {e}" # ═══════════════════════════════════════════════════════════════
 # 📝 FSM
