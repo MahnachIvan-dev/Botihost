@@ -1,6 +1,0 @@
-aiogram==3.31.0
-aiohttp>=3.12,<4
-groq==1.7.0
-python-dotenv>=1.1,<2
-aiofiles>=24.1,<26
-Pillow>=11,<13
