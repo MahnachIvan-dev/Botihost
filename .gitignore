@@ -1,8 +1,0 @@
-data/
-*.db
-*.session
-__pycache__/
-*.pyc
-.env
-.env.*
-*.log
