@@ -310,73 +310,153 @@ dp.message.middleware(BanMiddleware()); dp.callback_query.middleware(BanMiddlewa
 # 🚀 ОБЁРТКА И ЗАПУСК
 # ═══════════════════════════════════════════════════════════════
 WRAPPER_CODE = '''#!/usr/bin/env python3
-import os, sys, subprocess, time, signal, hashlib, re, venv, json
+import os
+import sys
+import subprocess
+import time
+import signal
+
 ENTRY_POINT = "{{ENTRY_POINT}}"
-print(f"\n[ BotHost ] Подготовка проекта... Точка входа: {ENTRY_POINT}", flush=True)
-VENV_DIR = ".venv"
-PYBIN = os.path.join(VENV_DIR, "bin", "python") if os.name != "nt" else os.path.join(VENV_DIR, "Scripts", "python.exe")
-if not os.path.exists(PYBIN):
-    print("[ BotHost ] Создаю изолированное окружение...", flush=True)
-    venv.EnvBuilder(with_pip=True).create(VENV_DIR)
-req_files=[]
-for root, dirs, files in os.walk("."):
-    dirs[:] = [d for d in dirs if d not in {VENV_DIR, "__pycache__", ".git"}]
-    for name in files:
-        low=name.lower()
-        if low=="requirements.txt" or (low.startswith("requirements") and low.endswith(".txt")):
-            req_files.append(os.path.join(root,name))
-req_files=sorted(set(req_files))
-digest=hashlib.sha256()
-for rf in req_files:
-    digest.update(rf.encode()); digest.update(open(rf,"rb").read())
-req_hash=digest.hexdigest(); marker=".requirements.installed"
-old_hash=open(marker,encoding="utf-8").read().strip() if os.path.exists(marker) else ""
-if req_files and req_hash != old_hash:
-    for rf in req_files:
-        print(f"[ BotHost ] Устанавливаю зависимости: {rf}", flush=True)
-        r=subprocess.run([PYBIN,"-m","pip","install","-r",rf,"--no-cache-dir","--disable-pip-version-check"])
-        if r.returncode: sys.exit(r.returncode)
-    open(marker,"w",encoding="utf-8").write(req_hash)
-IMPORT_TO_PACKAGE={"PIL":"Pillow","cv2":"opencv-python","bs4":"beautifulsoup4","dotenv":"python-dotenv","yaml":"PyYAML","Crypto":"pycryptodome","dateutil":"python-dateutil","jwt":"PyJWT","multipart":"python-multipart","fitz":"PyMuPDF","openai":"openai","groq":"groq","aiogram":"aiogram","discord":"discord.py","requests":"requests","aiohttp":"aiohttp","flask":"flask","fastapi":"fastapi","uvicorn":"uvicorn","pydantic":"pydantic","sqlalchemy":"sqlalchemy","redis":"redis","pymongo":"pymongo"}
-process=None
-def handle_signal(signum,frame):
+
+print(
+    "[ BotHost ] Подготовка проекта... Точка входа: "
+    + ENTRY_POINT,
+    flush=True
+)
+
+# Установка зависимостей
+if os.path.exists("requirements.txt"):
+    import hashlib
+
+    with open("requirements.txt", "rb") as f:
+        req_hash = hashlib.sha256(f.read()).hexdigest()
+
+    marker = ".requirements.installed"
+
+    if os.path.exists(marker):
+        with open(marker, "r", encoding="utf-8") as f:
+            old_hash = f.read().strip()
+    else:
+        old_hash = ""
+
+    if req_hash != old_hash:
+        print(
+            "[ BotHost ] Устанавливаю зависимости из requirements.txt...",
+            flush=True
+        )
+
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "pip",
+                "install",
+                "-r",
+                "requirements.txt",
+                "--quiet",
+                "--no-cache-dir",
+            ],
+            text=True,
+        )
+
+        if result.returncode != 0:
+            print(
+                "[ BotHost ] ОШИБКА: pip не смог установить зависимости.",
+                flush=True
+            )
+            sys.exit(result.returncode)
+
+        with open(marker, "w", encoding="utf-8") as f:
+            f.write(req_hash)
+
+# Окружение дочернего бота
+env = os.environ.copy()
+env["PYTHONUNBUFFERED"] = "1"
+
+# Поддержка пользовательского .env
+# Секреты самого BotHost специально не трогаем.
+if os.path.exists(".env"):
+    try:
+        with open(".env", "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+
+                if not line:
+                    continue
+
+                if line.startswith("#"):
+                    continue
+
+                if "=" not in line:
+                    continue
+
+                key, value = line.split("=", 1)
+                key = key.strip()
+                value = value.strip().strip("'").strip('"')
+
+                if key:
+                    env[key] = value
+
+    except Exception as e:
+        print(
+            "[ BotHost ] Не удалось прочитать .env: "
+            + str(e),
+            flush=True
+        )
+
+process = None
+
+
+def handle_signal(signum, frame):
     global process
-    if process:
-        try: process.terminate(); process.wait(timeout=5)
+
+    if process is not None:
+        try:
+            process.terminate()
+            process.wait(timeout=5)
         except Exception:
-            try: process.kill()
-            except Exception: pass
+            try:
+                process.kill()
+            except Exception:
+                pass
+
     sys.exit(0)
-signal.signal(signal.SIGTERM,handle_signal); signal.signal(signal.SIGINT,handle_signal)
-env={k:v for k,v in os.environ.items() if k not in {"BOT_TOKEN","CASHIER_TOKEN","GROQ_API_KEY","SYNC_CHANNEL_ID","SYNC_SECRET","OWNER_ID","OWNER_USERNAME","VERIFIER_BOT","DATABASE_URL","DATA_DIR","BOTHOST_USER_ENV","BOTHOST_BOT_TOKEN"} and not k.startswith("RAILWAY_")}
-env["PYTHONUNBUFFERED"]="1"
-try:
-    user_env=json.loads(os.environ.get("BOTHOST_USER_ENV","{}"))
-    if isinstance(user_env,dict): env.update({str(k):str(v) for k,v in user_env.items() if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*",str(k))})
-except Exception: pass
-if os.environ.get("BOTHOST_BOT_TOKEN"): env["BOT_TOKEN"]=os.environ["BOTHOST_BOT_TOKEN"]
-attempt=0
-while attempt<4:
-    process=subprocess.Popen([PYBIN,"-u",ENTRY_POINT],env=env,stdout=sys.stdout,stderr=subprocess.STDOUT)
-    while process.poll() is None: time.sleep(1)
-    ret=process.returncode
-    if ret==0: sys.exit(0)
-    attempt+=1
-    # Автоустановка отсутствующего модуля по последнему логу процесса.
-    missing=None
-    if os.path.exists("bot.log"):
-        txt=open("bot.log",encoding="utf-8",errors="ignore").read()[-12000:]
-        m=re.findall(r"No module named ['\"]([^'\"]+)",txt)
-        if m: missing=m[-1].split('.')[0]
-    if not missing: sys.exit(ret)
-    package=IMPORT_TO_PACKAGE.get(missing,missing)
-    print(f"[ BotHost ] Не хватает {missing}; устанавливаю {package}...",flush=True)
-    r=subprocess.run([PYBIN,"-m","pip","install",package,"--no-cache-dir","--disable-pip-version-check"])
-    if r.returncode: sys.exit(ret)
-sys.exit(ret)
+
+
+signal.signal(signal.SIGTERM, handle_signal)
+signal.signal(signal.SIGINT, handle_signal)
+
+print(
+    "[ BotHost ] Запуск: " + ENTRY_POINT,
+    flush=True
+)
+
+process = subprocess.Popen(
+    [sys.executable, "-u", ENTRY_POINT],
+    env=env,
+    stdout=sys.stdout,
+    stderr=subprocess.STDOUT,
+)
+
+while True:
+    return_code = process.poll()
+
+    if return_code is not None:
+        print(
+            "[ BotHost ] Процесс завершён. Код: "
+            + str(return_code),
+            flush=True
+        )
+        sys.exit(return_code)
+
+    time.sleep(1)
 '''
 
-def write_wrapper(bot_dir, entry_point): (bot_dir / "wrapper.py").write_text(WRAPPER_CODE.replace("{{ENTRY_POINT}}", entry_point), encoding="utf-8")
+def write_wrapper(bot_dir, entry_point):
+    (bot_dir / "wrapper.py").write_text(
+        WRAPPER_CODE.replace("{{ENTRY_POINT}}", entry_point),
+        encoding="utf-8"
+    )
 
 async def start_user_bot(bot_id):
     lock=start_locks.setdefault(bot_id,asyncio.Lock())
