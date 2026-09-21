@@ -129,6 +129,10 @@ def init_db():
         except sqlite3.OperationalError: pass
         try: c.execute("ALTER TABLE bots ADD COLUMN env_vars TEXT DEFAULT '{}'")
         except sqlite3.OperationalError: pass
+            try:
+    c.execute("ALTER TABLE bots ADD COLUMN env_vars TEXT NOT NULL DEFAULT '{}'")
+except sqlite3.OperationalError:
+    pass
     _db_retry(setup)
 
 def get_db():
