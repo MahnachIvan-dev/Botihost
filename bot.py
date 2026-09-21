@@ -20,6 +20,7 @@ import time
 import atexit
 import hmac
 import hashlib
+import json
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Dict
@@ -72,6 +73,7 @@ logger = logging.getLogger("BotHost")
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
 running_bots: Dict[int, subprocess.Popen] = {}
+start_locks: Dict[int, asyncio.Lock] = {}
 
 groq_client = None
 if GROQ_AVAILABLE and GROQ_API_KEY:
@@ -118,12 +120,14 @@ def init_db():
         c.execute("PRAGMA synchronous=NORMAL")
         c.execute("CREATE TABLE IF NOT EXISTS users (user_id INTEGER PRIMARY KEY, username TEXT, full_name TEXT, is_admin INTEGER DEFAULT 0, is_banned INTEGER DEFAULT 0, created_at TEXT)")
         c.execute("CREATE TABLE IF NOT EXISTS slots (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, plan TEXT, expires_at TEXT, created_at TEXT, gift_id TEXT)")
-        c.execute("CREATE TABLE IF NOT EXISTS bots (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, filename TEXT, bot_token TEXT, status TEXT DEFAULT 'stopped', created_at TEXT, is_frozen INTEGER DEFAULT 0, entry_point TEXT DEFAULT 'user_bot.py', auto_restart INTEGER DEFAULT 0)")
+        c.execute("CREATE TABLE IF NOT EXISTS bots (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, filename TEXT, bot_token TEXT, status TEXT DEFAULT 'stopped', created_at TEXT, is_frozen INTEGER DEFAULT 0, entry_point TEXT DEFAULT 'user_bot.py', auto_restart INTEGER DEFAULT 0, env_vars TEXT DEFAULT '{}')")
         c.execute("CREATE TABLE IF NOT EXISTS payment_requests (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, username TEXT, full_name TEXT, plan TEXT, status TEXT DEFAULT 'pending', created_at TEXT, processed_at TEXT)")
         c.execute("CREATE TABLE IF NOT EXISTS promocodes (id INTEGER PRIMARY KEY AUTOINCREMENT, code TEXT UNIQUE, plan TEXT, uses_left INTEGER, created_at TEXT)")
         c.execute("CREATE TABLE IF NOT EXISTS used_promos (user_id INTEGER, promo_id INTEGER, UNIQUE(user_id, promo_id))")
         c.execute("CREATE TABLE IF NOT EXISTS auto_grants (grant_id TEXT PRIMARY KEY, user_id INTEGER NOT NULL, plan TEXT NOT NULL, created_at TEXT NOT NULL)")
         try: c.execute("ALTER TABLE bots ADD COLUMN auto_restart INTEGER DEFAULT 0")
+        except sqlite3.OperationalError: pass
+        try: c.execute("ALTER TABLE bots ADD COLUMN env_vars TEXT DEFAULT '{}'")
         except sqlite3.OperationalError: pass
     _db_retry(setup)
 
@@ -163,6 +167,16 @@ def get_bot(bid): conn = get_db(); c = conn.cursor(); c.execute("SELECT * FROM b
 def get_all_bots(): conn = get_db(); c = conn.cursor(); c.execute("SELECT * FROM bots"); r = c.fetchall(); conn.close(); return r
 def update_bot_entry(bid, ep): conn = get_db(); c = conn.cursor(); c.execute("UPDATE bots SET entry_point = ? WHERE id = ?", (ep, bid)); conn.commit(); conn.close()
 def toggle_auto_restart(bid, val): conn = get_db(); c = conn.cursor(); c.execute("UPDATE bots SET auto_restart = ? WHERE id = ?", (val, bid)); conn.commit(); conn.close()
+def get_bot_env(bid):
+    b = get_bot(bid)
+    if not b or len(b) < 10: return {}
+    try: return json.loads(b[9] or "{}")
+    except Exception: return {}
+
+def set_bot_env(bid, env_vars):
+    payload = json.dumps(env_vars, ensure_ascii=False)
+    _db_retry(lambda conn: conn.execute("UPDATE bots SET env_vars = ? WHERE id = ?", (payload, bid)))
+
 def freeze_bot(bid): conn = get_db(); c = conn.cursor(); c.execute("UPDATE bots SET is_frozen = 1 WHERE id = ?", (bid,)); conn.commit(); conn.close()
 def unfreeze_bot(bid): conn = get_db(); c = conn.cursor(); c.execute("UPDATE bots SET is_frozen = 0 WHERE id = ?", (bid,)); conn.commit(); conn.close()
 def delete_bot_record(bid): conn = get_db(); c = conn.cursor(); c.execute("DELETE FROM bots WHERE id = ?", (bid,)); conn.commit(); conn.close()
@@ -215,83 +229,116 @@ dp.message.middleware(BanMiddleware()); dp.callback_query.middleware(BanMiddlewa
 # 🚀 ОБЁРТКА И ЗАПУСК
 # ═══════════════════════════════════════════════════════════════
 WRAPPER_CODE = '''#!/usr/bin/env python3
-import os, sys, subprocess, time, signal
+import os, sys, subprocess, time, signal, hashlib, re, venv, json
 ENTRY_POINT = "{{ENTRY_POINT}}"
-print(f"\\n[ BotHost ] Подготовка проекта... Точка входа: {ENTRY_POINT}", flush=True)
-
-if os.path.exists("requirements.txt"):
-    import hashlib
-    req_hash = hashlib.sha256(open("requirements.txt", "rb").read()).hexdigest()
-    marker = ".requirements.installed"
-    old_hash = open(marker, "r", encoding="utf-8").read().strip() if os.path.exists(marker) else ""
-    if req_hash != old_hash:
-        print("[ BotHost ] Устанавливаю зависимости из requirements.txt...", flush=True)
-        r = subprocess.run([sys.executable, "-m", "pip", "install", "-r", "requirements.txt", "--quiet", "--no-cache-dir"], text=True)
-        if r.returncode != 0:
-            print("[ BotHost ] ОШИБКА: pip не смог установить зависимости.", flush=True)
-            sys.exit(r.returncode)
-        open(marker, "w", encoding="utf-8").write(req_hash)
-
-process = None
-def handle_signal(signum, frame):
+print(f"\n[ BotHost ] Подготовка проекта... Точка входа: {ENTRY_POINT}", flush=True)
+VENV_DIR = ".venv"
+PYBIN = os.path.join(VENV_DIR, "bin", "python") if os.name != "nt" else os.path.join(VENV_DIR, "Scripts", "python.exe")
+if not os.path.exists(PYBIN):
+    print("[ BotHost ] Создаю изолированное окружение...", flush=True)
+    venv.EnvBuilder(with_pip=True).create(VENV_DIR)
+req_files=[]
+for root, dirs, files in os.walk("."):
+    dirs[:] = [d for d in dirs if d not in {VENV_DIR, "__pycache__", ".git"}]
+    for name in files:
+        low=name.lower()
+        if low=="requirements.txt" or (low.startswith("requirements") and low.endswith(".txt")):
+            req_files.append(os.path.join(root,name))
+req_files=sorted(set(req_files))
+digest=hashlib.sha256()
+for rf in req_files:
+    digest.update(rf.encode()); digest.update(open(rf,"rb").read())
+req_hash=digest.hexdigest(); marker=".requirements.installed"
+old_hash=open(marker,encoding="utf-8").read().strip() if os.path.exists(marker) else ""
+if req_files and req_hash != old_hash:
+    for rf in req_files:
+        print(f"[ BotHost ] Устанавливаю зависимости: {rf}", flush=True)
+        r=subprocess.run([PYBIN,"-m","pip","install","-r",rf,"--no-cache-dir","--disable-pip-version-check"])
+        if r.returncode: sys.exit(r.returncode)
+    open(marker,"w",encoding="utf-8").write(req_hash)
+IMPORT_TO_PACKAGE={"PIL":"Pillow","cv2":"opencv-python","bs4":"beautifulsoup4","dotenv":"python-dotenv","yaml":"PyYAML","Crypto":"pycryptodome","dateutil":"python-dateutil","jwt":"PyJWT","multipart":"python-multipart","fitz":"PyMuPDF","openai":"openai","groq":"groq","aiogram":"aiogram","discord":"discord.py","requests":"requests","aiohttp":"aiohttp","flask":"flask","fastapi":"fastapi","uvicorn":"uvicorn","pydantic":"pydantic","sqlalchemy":"sqlalchemy","redis":"redis","pymongo":"pymongo"}
+process=None
+def handle_signal(signum,frame):
+    global process
     if process:
-        process.terminate()
-        try: process.wait(timeout=5)
-        except: process.kill()
+        try: process.terminate(); process.wait(timeout=5)
+        except Exception:
+            try: process.kill()
+            except Exception: pass
     sys.exit(0)
-signal.signal(signal.SIGTERM, handle_signal)
-signal.signal(signal.SIGINT, handle_signal)
-
-env = os.environ.copy()
-env["PYTHONUNBUFFERED"] = "1"
-if os.path.exists(".env"):
-    with open(".env", "r", encoding="utf-8") as f:
-        for line in f:
-            if "=" in line and not line.startswith("#"):
-                k, v = line.strip().split("=", 1)
-                env[k] = v.strip("'\\"")
-
-process = subprocess.Popen([sys.executable, "-u", ENTRY_POINT], env=env, stdout=sys.stdout, stderr=subprocess.STDOUT)
-while True:
-    ret = process.poll()
-    if ret is not None: sys.exit(ret)
-    time.sleep(1)
+signal.signal(signal.SIGTERM,handle_signal); signal.signal(signal.SIGINT,handle_signal)
+env={k:v for k,v in os.environ.items() if k not in {"BOT_TOKEN","CASHIER_TOKEN","GROQ_API_KEY","SYNC_CHANNEL_ID","SYNC_SECRET","OWNER_ID","OWNER_USERNAME","VERIFIER_BOT","DATABASE_URL","DATA_DIR","BOTHOST_USER_ENV","BOTHOST_BOT_TOKEN"} and not k.startswith("RAILWAY_")}
+env["PYTHONUNBUFFERED"]="1"
+try:
+    user_env=json.loads(os.environ.get("BOTHOST_USER_ENV","{}"))
+    if isinstance(user_env,dict): env.update({str(k):str(v) for k,v in user_env.items() if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*",str(k))})
+except Exception: pass
+if os.environ.get("BOTHOST_BOT_TOKEN"): env["BOT_TOKEN"]=os.environ["BOTHOST_BOT_TOKEN"]
+attempt=0
+while attempt<4:
+    process=subprocess.Popen([PYBIN,"-u",ENTRY_POINT],env=env,stdout=sys.stdout,stderr=subprocess.STDOUT)
+    while process.poll() is None: time.sleep(1)
+    ret=process.returncode
+    if ret==0: sys.exit(0)
+    attempt+=1
+    # Автоустановка отсутствующего модуля по последнему логу процесса.
+    missing=None
+    if os.path.exists("bot.log"):
+        txt=open("bot.log",encoding="utf-8",errors="ignore").read()[-12000:]
+        m=re.findall(r"No module named ['\"]([^'\"]+)",txt)
+        if m: missing=m[-1].split('.')[0]
+    if not missing: sys.exit(ret)
+    package=IMPORT_TO_PACKAGE.get(missing,missing)
+    print(f"[ BotHost ] Не хватает {missing}; устанавливаю {package}...",flush=True)
+    r=subprocess.run([PYBIN,"-m","pip","install",package,"--no-cache-dir","--disable-pip-version-check"])
+    if r.returncode: sys.exit(ret)
+sys.exit(ret)
 '''
 
 def write_wrapper(bot_dir, entry_point): (bot_dir / "wrapper.py").write_text(WRAPPER_CODE.replace("{{ENTRY_POINT}}", entry_point), encoding="utf-8")
 
 async def start_user_bot(bot_id):
-    try:
-        b = get_bot(bot_id)
-        if not b or b[6] == 1: return False
-        bot_dir = BOTS_DIR / f"bot_{bot_id}"; bot_dir.mkdir(parents=True, exist_ok=True)
-        log_file = bot_dir / "bot.log"
-        with open(log_file, "a", encoding="utf-8") as f: f.write(f"\n[{datetime.now().strftime('%d.%m %H:%M:%S')}] === ЗАПУСК БОТА #{bot_id} ===\n"); f.flush()
-        env = os.environ.copy()
-        if b[3]: env["BOT_TOKEN"] = b[3]
-        env["PYTHONUNBUFFERED"] = "1"
-        lf = open(log_file, "a", encoding="utf-8")
-        proc = subprocess.Popen([sys.executable, "-u", "wrapper.py"], cwd=str(bot_dir), env=env, stdout=lf, stderr=subprocess.STDOUT, start_new_session=True)
-        running_bots[bot_id] = proc
-        await asyncio.sleep(4)
-        if proc.poll() is not None:
-            del running_bots[bot_id]
-            conn = get_db(); conn.execute("UPDATE bots SET status = 'error' WHERE id = ?", (bot_id,)); conn.commit(); conn.close(); return False
-        conn = get_db(); conn.execute("UPDATE bots SET status = 'running' WHERE id = ?", (bot_id,)); conn.commit(); conn.close(); return True
-    except Exception as e:
-        logger.exception("Не удалось запустить бот #%s: %s", bot_id, e)
-        return False
+    lock=start_locks.setdefault(bot_id,asyncio.Lock())
+    async with lock:
+        try:
+            b=get_bot(bot_id)
+            if not b or b[6]==1: return False
+            current=running_bots.get(bot_id)
+            if current and current.poll() is None: return True
+            bot_dir=BOTS_DIR/f"bot_{bot_id}"; bot_dir.mkdir(parents=True,exist_ok=True)
+            ep=b[7] if len(b)>7 and b[7] else "user_bot.py"; write_wrapper(bot_dir,ep)
+            log_file=bot_dir/"bot.log"
+            with open(log_file,"a",encoding="utf-8") as f: f.write(f"\n[{datetime.now().strftime('%d.%m %H:%M:%S')}] === ЗАПУСК БОТА #{bot_id} ===\n")
+            env=os.environ.copy()
+            for key in list(env):
+                if key.startswith("RAILWAY_") or key in {"BOT_TOKEN","CASHIER_TOKEN","GROQ_API_KEY","SYNC_CHANNEL_ID","SYNC_SECRET","OWNER_ID","OWNER_USERNAME","VERIFIER_BOT","DATABASE_URL","DATA_DIR","BOTHOST_USER_ENV","BOTHOST_BOT_TOKEN"}: env.pop(key,None)
+            user_env=get_bot_env(bot_id); env.update({str(k):str(v) for k,v in user_env.items() if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*",str(k))})
+            if b[3]: env["BOTHOST_BOT_TOKEN"]=b[3]
+            env["BOTHOST_USER_ENV"]=json.dumps(user_env,ensure_ascii=False); env["PYTHONUNBUFFERED"]="1"
+            lf=open(log_file,"a",encoding="utf-8")
+            proc=subprocess.Popen([sys.executable,"-u","wrapper.py"],cwd=str(bot_dir),env=env,stdout=lf,stderr=subprocess.STDOUT,start_new_session=True)
+            running_bots[bot_id]=proc; await asyncio.sleep(4)
+            if proc.poll() is not None:
+                if running_bots.get(bot_id) is proc: running_bots.pop(bot_id,None)
+                _db_retry(lambda conn: conn.execute("UPDATE bots SET status='error' WHERE id=?",(bot_id,)))
+                return False
+            _db_retry(lambda conn: conn.execute("UPDATE bots SET status='running' WHERE id=?",(bot_id,)))
+            return True
+        except Exception as e:
+            logger.exception("Не удалось запустить бот #%s: %s",bot_id,e); return False
 
 async def stop_user_bot(bot_id):
-    if bot_id in running_bots:
-        proc = running_bots.pop(bot_id)
-        try: os.killpg(os.getpgid(proc.pid), signal.SIGTERM); proc.wait(timeout=3)
-        except:
-            try: os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-            except: pass
-    conn = get_db()
-    conn.execute("UPDATE bots SET status = 'stopped' WHERE id = ?", (bot_id,))
-    conn.commit(); conn.close()
+    lock=start_locks.setdefault(bot_id,asyncio.Lock())
+    async with lock:
+        proc=running_bots.pop(bot_id,None)
+        if proc:
+            try: os.killpg(os.getpgid(proc.pid),signal.SIGTERM); proc.wait(timeout=3)
+            except Exception:
+                try: os.killpg(os.getpgid(proc.pid),signal.SIGKILL)
+                except Exception: pass
+        try: _db_retry(lambda conn: conn.execute("UPDATE bots SET status='stopped' WHERE id=?",(bot_id,)))
+        except Exception as e: logger.warning("Не удалось обновить статус бота #%s: %s",bot_id,e)
+
 
 def get_bot_logs(bot_id, lines=50):
     lf = BOTS_DIR / f"bot_{bot_id}" / "bot.log"
@@ -303,9 +350,10 @@ def list_bot_files(bot_id):
     bot_dir = BOTS_DIR / f"bot_{bot_id}"
     if not bot_dir.exists(): return []
     files = []
-    for root, _, fs in os.walk(bot_dir):
+    for root, dirs, fs in os.walk(bot_dir):
+        dirs[:] = [d for d in dirs if d not in {".venv", "__pycache__", ".git"}]
         for f in fs:
-            if f in ("wrapper.py", "bot.log"): continue
+            if f in ("wrapper.py", "bot.log", ".requirements.installed"): continue
             files.append((str(Path(root) / f).replace(str(bot_dir)+"/", ""), (Path(root) / f).stat().st_size))
     return files
 
@@ -314,7 +362,8 @@ async def monitor_bots():
         try:
             for bot_id, proc in list(running_bots.items()):
                 if proc.poll() is not None:
-                    code = proc.returncode; del running_bots[bot_id]
+                    code = proc.returncode
+                    if running_bots.get(bot_id) is proc: running_bots.pop(bot_id,None)
                     conn = get_db(); c = conn.cursor()
                     c.execute("UPDATE bots SET status = 'error' WHERE id = ?", (bot_id,))
                     c.execute("SELECT user_id, auto_restart FROM bots WHERE id = ?", (bot_id,))
@@ -417,15 +466,15 @@ def get_profile_link():
 
 def main_menu_kb(uid):
     buttons = [
-        [InlineKeyboardButton(text="💎 Купить слот", callback_data="buy"),
-         InlineKeyboardButton(text="🎟 Промокод", callback_data="promo_enter")],
-        [InlineKeyboardButton(text="📤 Загрузить бота", callback_data="upload")],
-        [InlineKeyboardButton(text="🤖 Мои боты", callback_data="mybots"),
-         InlineKeyboardButton(text="📊 Мои слоты", callback_data="myslots")],
-        [InlineKeyboardButton(text="❓ Помощь", callback_data="help")]
+        [InlineKeyboardButton(text="💳 Тарифы", callback_data="buy"),
+         InlineKeyboardButton(text="🎁 Промокод", callback_data="promo_enter")],
+        [InlineKeyboardButton(text="➕ Новый бот", callback_data="upload")],
+        [InlineKeyboardButton(text="🤖 Мои проекты", callback_data="mybots"),
+         InlineKeyboardButton(text="📦 Моя подписка", callback_data="myslots")],
+        [InlineKeyboardButton(text="ℹ️ Как это работает", callback_data="help")]
     ]
     if is_admin(uid):
-        buttons.append([InlineKeyboardButton(text="👑 Панель управления", callback_data="admin")])
+        buttons.append([InlineKeyboardButton(text="🛠 Администрирование", callback_data="admin")])
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 def get_uptime():
@@ -440,6 +489,42 @@ def get_uptime():
 # Кассир пишет в канал: /auto_grant USER_ID PLAN GRANT_ID SIGNATURE
 # Хост проверяет подпись и выдаёт слот
 # ═══════════════════════════════════════════════════════════════
+
+@dp.channel_post(F.text.startswith("/payment_request"))
+async def channel_payment_request(message: types.Message):
+    try:
+        parts=message.text.strip().split()
+        if len(parts)<5 or not SYNC_SECRET: return
+        uid=int(parts[1]); plan=parts[2]; username=parts[3]; sig=parts[4]
+        expected=hmac.new(SYNC_SECRET.encode(),f"request:{uid}:{plan}:{username}".encode(),hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(sig,expected) or plan not in PLANS: return
+        create_user(uid, username, "")
+        if not user_has_pending_request(uid):
+            create_payment_request(uid, username, "", plan)
+        logger.info("Payment request received from cashier: user=%s plan=%s", uid, plan)
+    except Exception: pass
+
+@dp.channel_post(F.text.startswith("/payment_result"))
+async def channel_payment_result(message: types.Message):
+    try:
+        parts=message.text.strip().split()
+        if len(parts)<6 or not SYNC_SECRET: return
+        uid=int(parts[1]); plan=parts[2]; result=parts[3].upper(); grant_id=parts[4]; sig=parts[5]
+        expected=hmac.new(SYNC_SECRET.encode(),f"result:{uid}:{plan}:{result}:{grant_id}".encode(),hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(sig,expected) or plan not in PLANS: return
+        if result=="APPROVED":
+            def grant(conn):
+                if conn.execute("SELECT 1 FROM auto_grants WHERE grant_id=?",(grant_id,)).fetchone(): return False
+                conn.execute("INSERT INTO auto_grants(grant_id,user_id,plan,created_at) VALUES(?,?,?,?)",(grant_id,uid,plan,datetime.now().isoformat()))
+                conn.execute("INSERT INTO users(user_id,username,full_name,created_at) VALUES(?,'','',?) ON CONFLICT(user_id) DO NOTHING",(uid,datetime.now().isoformat()))
+                exp=datetime.now()+timedelta(days=PLANS[plan]["days"]); conn.execute("INSERT INTO slots(user_id,plan,expires_at,created_at) VALUES(?,?,?,?)",(uid,plan,exp.isoformat(),datetime.now().isoformat())); return True
+            if _db_retry(grant):
+                try: await bot.send_message(uid,"🎉 <b>Оплата подтверждена!</b>\nСлот активирован.",reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="➕ Новый бот",callback_data="upload")],[InlineKeyboardButton(text="🤖 Мои проекты",callback_data="mybots")]]),parse_mode="HTML")
+                except Exception: pass
+        elif result=="REJECTED":
+            try: await bot.send_message(uid,"❌ <b>Оплата не подтверждена.</b>\nОтправь два чётких скриншота повторно через кассира.",parse_mode="HTML")
+            except Exception: pass
+    except Exception: logger.exception("payment_result error")
 
 @dp.channel_post(F.text.startswith("/auto_grant"))
 async def channel_auto_grant(message: types.Message):
@@ -484,7 +569,7 @@ async def channel_auto_grant(message: types.Message):
                 "🚀 Слот уже активен — можно загружать проект.",
                 reply_markup=InlineKeyboardMarkup(inline_keyboard=[
                     [InlineKeyboardButton(text="📤 Загрузить проект", callback_data="upload")],
-                    [InlineKeyboardButton(text="🤖 Мои боты", callback_data="mybots")],
+                    [InlineKeyboardButton(text="🤖 Мои проекты", callback_data="mybots")],
                     [InlineKeyboardButton(text="« Главное меню", callback_data="back_main")]
                 ]),
                 parse_mode="HTML"
@@ -510,14 +595,14 @@ async def cmd_start(message: types.Message, state: FSMContext):
     name = html.escape(message.from_user.first_name or "друг")
     text = (
         f"👋 <b>Привет, {name}!</b>\n\n"
-        f"Добро пожаловать в <b>BotHost v7.5</b> 💎\n\n"
-        f"🚀 <b>Возможности:</b>\n"
-        f"• Хостинг Telegram и Discord ботов на Python\n"
-        f"• 🧠 ИИ-дебаггер ошибок\n"
-        f"• ⚙️ Редактор .env прямо в чате\n"
-        f"• 🔄 Авто-рестарт при падении\n"
-        f"• ⚡ Мгновенная оплата через ИИ-кассира\n"
-        f"• 📦 ZIP-архивы и автоустановка библиотек"
+        f"Добро пожаловать в <b>BotHost</b> — загрузил проект, настроил переменные и запускаешь. 🚀\n\n"
+        f"<b>Что умеет хостинг:</b>\n"
+        f"• 📦 .py и .zip проекты\n"
+        f"• 📚 автоматическая установка библиотек\n"
+        f"• 🔄 авто-рестарт и контроль состояния\n"
+        f"• 📄 логи + 🧠 ИИ-помощник\n"
+        f"• ⚙️ переменные окружения без .env-файлов\n\n"
+        f"Выбери действие ниже — дальше всё делается кнопками."
     )
     await message.answer(text, reply_markup=main_menu_kb(message.from_user.id), parse_mode="HTML")
 
@@ -531,13 +616,13 @@ async def back_main(call: types.CallbackQuery, state: FSMContext):
     await state.clear()
     try:
         await call.message.edit_text(
-            "✨ <b>BotHost</b>",
+            "🏠 <b>BotHost</b>",
             reply_markup=main_menu_kb(call.from_user.id),
             parse_mode="HTML"
         )
     except Exception:
         await call.message.answer(
-            "✨ <b>BotHost</b>",
+            "🏠 <b>BotHost</b>",
             reply_markup=main_menu_kb(call.from_user.id),
             parse_mode="HTML"
         )
@@ -637,7 +722,7 @@ async def handle_files(message: types.Message, state: FSMContext):
             "❌ <b>Нет активного слота!</b>\nКупи слот или введи промокод.",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[
                 [InlineKeyboardButton(text="💎 Купить", callback_data="buy"),
-                 InlineKeyboardButton(text="🎟 Промокод", callback_data="promo_enter")]
+                 InlineKeyboardButton(text="🎁 Промокод", callback_data="promo_enter")]
             ]),
             parse_mode="HTML"
         )
@@ -688,9 +773,9 @@ async def handle_token(message: types.Message, state: FSMContext):
         await msg.edit_text(
             f"✅ <b>Бот #{bid} развёрнут!</b>\n"
             f"🚀 Точка входа: <code>{html.escape(ep)}</code>\n\n"
-            f"Зайди в «🤖 Мои боты» → ▶️ Запуск",
+            f"Зайди в «🤖 Мои проекты» → ▶️ Запуск",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="🤖 Мои боты", callback_data="mybots")]
+                [InlineKeyboardButton(text="🤖 Мои проекты", callback_data="mybots")]
             ]),
             parse_mode="HTML"
         )
@@ -861,7 +946,7 @@ async def process_promo(message: types.Message, state: FSMContext):
             f"Тариф: {p['emoji']} <b>{p['name']}</b> ({p['days']} дн.)",
             parse_mode="HTML",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="📤 Загрузить бота", callback_data="upload")],
+                [InlineKeyboardButton(text="➕ Новый бот", callback_data="upload")],
                 [InlineKeyboardButton(text="« Меню", callback_data="back_main")]
             ])
         )
@@ -948,7 +1033,7 @@ async def cb_bot_detail(call: types.CallbackQuery, state: FSMContext = None):
          InlineKeyboardButton(text="📄 Логи", callback_data=f"logs:{bid}")],
         [InlineKeyboardButton(text=f"🔄 Авто-рестарт: {auto_r}", callback_data=f"toggle_restart:{bid}")],
         [InlineKeyboardButton(text="📁 Файлы", callback_data=f"files:{bid}"),
-         InlineKeyboardButton(text="⚙️ .env", callback_data=f"envmenu:{bid}")],
+         InlineKeyboardButton(text="⚙️ Переменные", callback_data=f"envmenu:{bid}")],
         [InlineKeyboardButton(text="🧠 AI Поиск ошибки", callback_data=f"ai:{bid}")],
         [InlineKeyboardButton(text="🗑 Удалить", callback_data=f"del:{bid}")]
     ]
@@ -1055,38 +1140,36 @@ async def cb_unfreeze(call: types.CallbackQuery):
 
 @dp.callback_query(F.data.startswith("envmenu:"))
 async def cb_envmenu(call: types.CallbackQuery, state: FSMContext = None):
-    if state:
-        await state.clear()
-    bid = int(call.data.split(":")[1])
-    await call.message.edit_text(
-        f"⚙️ <b>.env бота #{bid}</b>\n\nПеременные окружения (токены API и т.д.)",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="📝 Редактировать .env", callback_data=f"editenv:{bid}")],
-            [InlineKeyboardButton(text="« К боту", callback_data=f"bot:{bid}")]
-        ]),
-        parse_mode="HTML"
-    )
+    if state: await state.clear()
+    bid=int(call.data.split(":")[1]); b=get_bot(bid)
+    if not b or (b[1]!=call.from_user.id and not is_admin(call.from_user.id)): return await call.answer("❌ Нет доступа",show_alert=True)
+    envs=get_bot_env(bid); names=", ".join(envs.keys()) if envs else "пока не заданы"
+    await call.message.edit_text(f"⚙️ <b>Переменные · проект #{bid}</b>\n\nБез .env-файлов. Значения передаются процессу только при запуске.\n\nКлючи: <code>{html.escape(names[:800])}</code>",reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="✏️ Изменить переменные",callback_data=f"editenv:{bid}")],[InlineKeyboardButton(text="🧹 Очистить",callback_data=f"clearenv:{bid}")],[InlineKeyboardButton(text="« К проекту",callback_data=f"bot:{bid}")]]),parse_mode="HTML")
 
 @dp.callback_query(F.data.startswith("editenv:"))
-async def cb_editenv(call: types.CallbackQuery, state: FSMContext):
-    bid = int(call.data.split(":")[1])
-    env_p = BOTS_DIR / f"bot_{bid}" / ".env"
-    curr = env_p.read_text(encoding="utf-8") if env_p.exists() else "# Пусто"
-    await state.set_state(EnvStates.waiting_env_text)
-    await state.update_data(target_bid=bid)
-    await call.message.edit_text(
-        f"📝 <b>Текущий .env:</b>\n<pre>{html.escape(curr[:3000])}</pre>\n\n"
-        f"Отправь новый текст (KEY=VALUE) или /cancel",
-        parse_mode="HTML"
-    )
+async def cb_editenv(call: types.CallbackQuery,state:FSMContext):
+    bid=int(call.data.split(":")[1]); b=get_bot(bid)
+    if not b or (b[1]!=call.from_user.id and not is_admin(call.from_user.id)): return await call.answer("❌ Нет доступа",show_alert=True)
+    curr=get_bot_env(bid); lines="\n".join(f"{k}={v}" for k,v in curr.items())
+    await state.set_state(EnvStates.waiting_env_text); await state.update_data(target_bid=bid)
+    await call.message.edit_text(f"✏️ <b>Переменные проекта #{bid}</b>\n\n<pre>{html.escape(lines[:3000] or 'пусто')}</pre>\n\nОтправь строки <code>KEY=VALUE</code>, каждая с новой строки.\n/cancel — отмена",parse_mode="HTML")
+
+@dp.callback_query(F.data.startswith("clearenv:"))
+async def cb_clearenv(call: types.CallbackQuery):
+    bid=int(call.data.split(":")[1]); b=get_bot(bid)
+    if not b or (b[1]!=call.from_user.id and not is_admin(call.from_user.id)): return await call.answer("❌ Нет доступа",show_alert=True)
+    set_bot_env(bid,{}); await call.answer("Переменные очищены"); await cb_envmenu(call,None)
 
 @dp.message(EnvStates.waiting_env_text)
-async def env_saved(message: types.Message, state: FSMContext):
-    data = await state.get_data()
-    bid = data["target_bid"]
-    (BOTS_DIR / f"bot_{bid}" / ".env").write_text(message.text or "", encoding="utf-8")
-    await message.answer("✅ <b>.env сохранён!</b> Перезапусти бота.", parse_mode="HTML")
-    await state.clear()
+async def env_saved(message: types.Message,state:FSMContext):
+    data=await state.get_data(); bid=data["target_bid"]; parsed={}
+    for raw in (message.text or "").splitlines():
+        line=raw.strip()
+        if not line or line.startswith("#") or "=" not in line: continue
+        k,v=line.split("=",1); k=k.strip(); v=v.strip().strip("'\"")
+        if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*",k): parsed[k]=v
+    set_bot_env(bid,parsed); await state.clear()
+    await message.answer("✅ Переменные сохранены. Перезапусти проект, чтобы применить их.",reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="« К проекту",callback_data=f"bot:{bid}")]]))
 
 @dp.callback_query(F.data.startswith("ai:"))
 async def cb_ai(call: types.CallbackQuery):
@@ -1242,7 +1325,7 @@ async def cb_admin(call: types.CallbackQuery, state: FSMContext = None):
     )
     kb = [
         [InlineKeyboardButton(text=pay_btn, callback_data="adm_payments"),
-         InlineKeyboardButton(text="🎟 Промокоды", callback_data="adm_promos")],
+         InlineKeyboardButton(text="🎁 Промокоды", callback_data="adm_promos")],
         [InlineKeyboardButton(text="🤖 Все боты", callback_data="adm_allbots"),
          InlineKeyboardButton(text="🔍 Поиск бота", callback_data="adm_searchbot")],
         [InlineKeyboardButton(text="✉️ ЛС юзеру", callback_data="adm_msguser"),
