@@ -118,23 +118,100 @@ def init_db():
         c = conn.cursor()
         c.execute("PRAGMA journal_mode=WAL")
         c.execute("PRAGMA synchronous=NORMAL")
-        c.execute("CREATE TABLE IF NOT EXISTS users (user_id INTEGER PRIMARY KEY, username TEXT, full_name TEXT, is_admin INTEGER DEFAULT 0, is_banned INTEGER DEFAULT 0, created_at TEXT)")
-        c.execute("CREATE TABLE IF NOT EXISTS slots (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, plan TEXT, expires_at TEXT, created_at TEXT, gift_id TEXT)")
-        c.execute("CREATE TABLE IF NOT EXISTS bots (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, filename TEXT, bot_token TEXT, status TEXT DEFAULT 'stopped', created_at TEXT, is_frozen INTEGER DEFAULT 0, entry_point TEXT DEFAULT 'user_bot.py', auto_restart INTEGER DEFAULT 0, env_vars TEXT DEFAULT '{}')")
-        c.execute("CREATE TABLE IF NOT EXISTS payment_requests (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, username TEXT, full_name TEXT, plan TEXT, status TEXT DEFAULT 'pending', created_at TEXT, processed_at TEXT)")
-        c.execute("CREATE TABLE IF NOT EXISTS promocodes (id INTEGER PRIMARY KEY AUTOINCREMENT, code TEXT UNIQUE, plan TEXT, uses_left INTEGER, created_at TEXT)")
-        c.execute("CREATE TABLE IF NOT EXISTS used_promos (user_id INTEGER, promo_id INTEGER, UNIQUE(user_id, promo_id))")
-        c.execute("CREATE TABLE IF NOT EXISTS auto_grants (grant_id TEXT PRIMARY KEY, user_id INTEGER NOT NULL, plan TEXT NOT NULL, created_at TEXT NOT NULL)")
-        try: c.execute("ALTER TABLE bots ADD COLUMN auto_restart INTEGER DEFAULT 0")
-        except sqlite3.OperationalError: pass
-        try: c.execute("ALTER TABLE bots ADD COLUMN env_vars TEXT DEFAULT '{}'")
-        except sqlite3.OperationalError: pass
-            try:
-    c.execute("ALTER TABLE bots ADD COLUMN env_vars TEXT NOT NULL DEFAULT '{}'")
-except sqlite3.OperationalError:
-    pass
-    _db_retry(setup)
 
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                user_id INTEGER PRIMARY KEY,
+                username TEXT,
+                full_name TEXT,
+                is_admin INTEGER DEFAULT 0,
+                is_banned INTEGER DEFAULT 0,
+                created_at TEXT
+            )
+        """)
+
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS slots (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER,
+                plan TEXT,
+                expires_at TEXT,
+                created_at TEXT,
+                gift_id TEXT
+            )
+        """)
+
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS bots (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER,
+                filename TEXT,
+                bot_token TEXT,
+                status TEXT DEFAULT 'stopped',
+                created_at TEXT,
+                is_frozen INTEGER DEFAULT 0,
+                entry_point TEXT DEFAULT 'user_bot.py',
+                auto_restart INTEGER DEFAULT 0
+            )
+        """)
+
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS payment_requests (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER,
+                username TEXT,
+                full_name TEXT,
+                plan TEXT,
+                status TEXT DEFAULT 'pending',
+                created_at TEXT,
+                processed_at TEXT
+            )
+        """)
+
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS promocodes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                code TEXT UNIQUE,
+                plan TEXT,
+                uses_left INTEGER,
+                created_at TEXT
+            )
+        """)
+
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS used_promos (
+                user_id INTEGER,
+                promo_id INTEGER,
+                UNIQUE(user_id, promo_id)
+            )
+        """)
+
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS auto_grants (
+                grant_id TEXT PRIMARY KEY,
+                user_id INTEGER NOT NULL,
+                plan TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            )
+        """)
+
+        # Миграция старой базы: auto_restart
+        try:
+            c.execute(
+                "ALTER TABLE bots ADD COLUMN auto_restart INTEGER DEFAULT 0"
+            )
+        except sqlite3.OperationalError:
+            pass
+
+        # Миграция старой базы: env_vars
+        try:
+            c.execute(
+                "ALTER TABLE bots ADD COLUMN env_vars TEXT NOT NULL DEFAULT '{}'"
+            )
+        except sqlite3.OperationalError:
+            pass
+
+    _db_retry(setup)
 def get_db():
     return _db_connect()
 
