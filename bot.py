@@ -118,100 +118,24 @@ def init_db():
         c = conn.cursor()
         c.execute("PRAGMA journal_mode=WAL")
         c.execute("PRAGMA synchronous=NORMAL")
-
-        c.execute("""
-            CREATE TABLE IF NOT EXISTS users (
-                user_id INTEGER PRIMARY KEY,
-                username TEXT,
-                full_name TEXT,
-                is_admin INTEGER DEFAULT 0,
-                is_banned INTEGER DEFAULT 0,
-                created_at TEXT
-            )
-        """)
-
-        c.execute("""
-            CREATE TABLE IF NOT EXISTS slots (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER,
-                plan TEXT,
-                expires_at TEXT,
-                created_at TEXT,
-                gift_id TEXT
-            )
-        """)
-
-        c.execute("""
-            CREATE TABLE IF NOT EXISTS bots (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER,
-                filename TEXT,
-                bot_token TEXT,
-                status TEXT DEFAULT 'stopped',
-                created_at TEXT,
-                is_frozen INTEGER DEFAULT 0,
-                entry_point TEXT DEFAULT 'user_bot.py',
-                auto_restart INTEGER DEFAULT 0
-            )
-        """)
-
-        c.execute("""
-            CREATE TABLE IF NOT EXISTS payment_requests (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER,
-                username TEXT,
-                full_name TEXT,
-                plan TEXT,
-                status TEXT DEFAULT 'pending',
-                created_at TEXT,
-                processed_at TEXT
-            )
-        """)
-
-        c.execute("""
-            CREATE TABLE IF NOT EXISTS promocodes (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                code TEXT UNIQUE,
-                plan TEXT,
-                uses_left INTEGER,
-                created_at TEXT
-            )
-        """)
-
-        c.execute("""
-            CREATE TABLE IF NOT EXISTS used_promos (
-                user_id INTEGER,
-                promo_id INTEGER,
-                UNIQUE(user_id, promo_id)
-            )
-        """)
-
-        c.execute("""
-            CREATE TABLE IF NOT EXISTS auto_grants (
-                grant_id TEXT PRIMARY KEY,
-                user_id INTEGER NOT NULL,
-                plan TEXT NOT NULL,
-                created_at TEXT NOT NULL
-            )
-        """)
-
-        # Миграция старой базы: auto_restart
-        try:
-            c.execute(
-                "ALTER TABLE bots ADD COLUMN auto_restart INTEGER DEFAULT 0"
-            )
-        except sqlite3.OperationalError:
-            pass
-
-        # Миграция старой базы: env_vars
-        try:
-            c.execute(
-                "ALTER TABLE bots ADD COLUMN env_vars TEXT NOT NULL DEFAULT '{}'"
-            )
-        except sqlite3.OperationalError:
-            pass
-
+        c.execute("CREATE TABLE IF NOT EXISTS users (user_id INTEGER PRIMARY KEY, username TEXT, full_name TEXT, is_admin INTEGER DEFAULT 0, is_banned INTEGER DEFAULT 0, created_at TEXT)")
+        c.execute("CREATE TABLE IF NOT EXISTS slots (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, plan TEXT, expires_at TEXT, created_at TEXT, gift_id TEXT)")
+        c.execute("CREATE TABLE IF NOT EXISTS bots (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, filename TEXT, bot_token TEXT, status TEXT DEFAULT 'stopped', created_at TEXT, is_frozen INTEGER DEFAULT 0, entry_point TEXT DEFAULT 'user_bot.py', auto_restart INTEGER DEFAULT 0, env_vars TEXT DEFAULT '{}')")
+        c.execute("CREATE TABLE IF NOT EXISTS payment_requests (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, username TEXT, full_name TEXT, plan TEXT, status TEXT DEFAULT 'pending', created_at TEXT, processed_at TEXT)")
+        c.execute("CREATE TABLE IF NOT EXISTS promocodes (id INTEGER PRIMARY KEY AUTOINCREMENT, code TEXT UNIQUE, plan TEXT, uses_left INTEGER, created_at TEXT)")
+        c.execute("CREATE TABLE IF NOT EXISTS used_promos (user_id INTEGER, promo_id INTEGER, UNIQUE(user_id, promo_id))")
+        c.execute("CREATE TABLE IF NOT EXISTS auto_grants (grant_id TEXT PRIMARY KEY, user_id INTEGER NOT NULL, plan TEXT NOT NULL, created_at TEXT NOT NULL)")
+        # Миграции старых БД: добавляем колонки независимо от того,
+        # когда была создана таблица bots.
+        cols = {row[1] for row in c.execute("PRAGMA table_info(bots)").fetchall()}
+        if "entry_point" not in cols:
+            c.execute("ALTER TABLE bots ADD COLUMN entry_point TEXT DEFAULT 'user_bot.py'")
+        if "auto_restart" not in cols:
+            c.execute("ALTER TABLE bots ADD COLUMN auto_restart INTEGER DEFAULT 0")
+        if "env_vars" not in cols:
+            c.execute("ALTER TABLE bots ADD COLUMN env_vars TEXT DEFAULT '{}'")
     _db_retry(setup)
+
 def get_db():
     return _db_connect()
 
@@ -310,153 +234,73 @@ dp.message.middleware(BanMiddleware()); dp.callback_query.middleware(BanMiddlewa
 # 🚀 ОБЁРТКА И ЗАПУСК
 # ═══════════════════════════════════════════════════════════════
 WRAPPER_CODE = '''#!/usr/bin/env python3
-import os
-import sys
-import subprocess
-import time
-import signal
-
+import os, sys, subprocess, time, signal, hashlib, re, venv, json
 ENTRY_POINT = "{{ENTRY_POINT}}"
-
-print(
-    "[ BotHost ] Подготовка проекта... Точка входа: "
-    + ENTRY_POINT,
-    flush=True
-)
-
-# Установка зависимостей
-if os.path.exists("requirements.txt"):
-    import hashlib
-
-    with open("requirements.txt", "rb") as f:
-        req_hash = hashlib.sha256(f.read()).hexdigest()
-
-    marker = ".requirements.installed"
-
-    if os.path.exists(marker):
-        with open(marker, "r", encoding="utf-8") as f:
-            old_hash = f.read().strip()
-    else:
-        old_hash = ""
-
-    if req_hash != old_hash:
-        print(
-            "[ BotHost ] Устанавливаю зависимости из requirements.txt...",
-            flush=True
-        )
-
-        result = subprocess.run(
-            [
-                sys.executable,
-                "-m",
-                "pip",
-                "install",
-                "-r",
-                "requirements.txt",
-                "--quiet",
-                "--no-cache-dir",
-            ],
-            text=True,
-        )
-
-        if result.returncode != 0:
-            print(
-                "[ BotHost ] ОШИБКА: pip не смог установить зависимости.",
-                flush=True
-            )
-            sys.exit(result.returncode)
-
-        with open(marker, "w", encoding="utf-8") as f:
-            f.write(req_hash)
-
-# Окружение дочернего бота
-env = os.environ.copy()
-env["PYTHONUNBUFFERED"] = "1"
-
-# Поддержка пользовательского .env
-# Секреты самого BotHost специально не трогаем.
-if os.path.exists(".env"):
-    try:
-        with open(".env", "r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-
-                if not line:
-                    continue
-
-                if line.startswith("#"):
-                    continue
-
-                if "=" not in line:
-                    continue
-
-                key, value = line.split("=", 1)
-                key = key.strip()
-                value = value.strip().strip("'").strip('"')
-
-                if key:
-                    env[key] = value
-
-    except Exception as e:
-        print(
-            "[ BotHost ] Не удалось прочитать .env: "
-            + str(e),
-            flush=True
-        )
-
-process = None
-
-
-def handle_signal(signum, frame):
+print(f"\n[ BotHost ] Подготовка проекта... Точка входа: {ENTRY_POINT}", flush=True)
+VENV_DIR = ".venv"
+PYBIN = os.path.join(VENV_DIR, "bin", "python") if os.name != "nt" else os.path.join(VENV_DIR, "Scripts", "python.exe")
+if not os.path.exists(PYBIN):
+    print("[ BotHost ] Создаю изолированное окружение...", flush=True)
+    venv.EnvBuilder(with_pip=True).create(VENV_DIR)
+req_files=[]
+for root, dirs, files in os.walk("."):
+    dirs[:] = [d for d in dirs if d not in {VENV_DIR, "__pycache__", ".git"}]
+    for name in files:
+        low=name.lower()
+        if low=="requirements.txt" or (low.startswith("requirements") and low.endswith(".txt")):
+            req_files.append(os.path.join(root,name))
+req_files=sorted(set(req_files))
+digest=hashlib.sha256()
+for rf in req_files:
+    digest.update(rf.encode()); digest.update(open(rf,"rb").read())
+req_hash=digest.hexdigest(); marker=".requirements.installed"
+old_hash=open(marker,encoding="utf-8").read().strip() if os.path.exists(marker) else ""
+if req_files and req_hash != old_hash:
+    for rf in req_files:
+        print(f"[ BotHost ] Устанавливаю зависимости: {rf}", flush=True)
+        r=subprocess.run([PYBIN,"-m","pip","install","-r",rf,"--no-cache-dir","--disable-pip-version-check"])
+        if r.returncode: sys.exit(r.returncode)
+    open(marker,"w",encoding="utf-8").write(req_hash)
+IMPORT_TO_PACKAGE={"PIL":"Pillow","cv2":"opencv-python","bs4":"beautifulsoup4","dotenv":"python-dotenv","yaml":"PyYAML","Crypto":"pycryptodome","dateutil":"python-dateutil","jwt":"PyJWT","multipart":"python-multipart","fitz":"PyMuPDF","openai":"openai","groq":"groq","aiogram":"aiogram","discord":"discord.py","requests":"requests","aiohttp":"aiohttp","flask":"flask","fastapi":"fastapi","uvicorn":"uvicorn","pydantic":"pydantic","sqlalchemy":"sqlalchemy","redis":"redis","pymongo":"pymongo"}
+process=None
+def handle_signal(signum,frame):
     global process
-
-    if process is not None:
-        try:
-            process.terminate()
-            process.wait(timeout=5)
+    if process:
+        try: process.terminate(); process.wait(timeout=5)
         except Exception:
-            try:
-                process.kill()
-            except Exception:
-                pass
-
+            try: process.kill()
+            except Exception: pass
     sys.exit(0)
-
-
-signal.signal(signal.SIGTERM, handle_signal)
-signal.signal(signal.SIGINT, handle_signal)
-
-print(
-    "[ BotHost ] Запуск: " + ENTRY_POINT,
-    flush=True
-)
-
-process = subprocess.Popen(
-    [sys.executable, "-u", ENTRY_POINT],
-    env=env,
-    stdout=sys.stdout,
-    stderr=subprocess.STDOUT,
-)
-
-while True:
-    return_code = process.poll()
-
-    if return_code is not None:
-        print(
-            "[ BotHost ] Процесс завершён. Код: "
-            + str(return_code),
-            flush=True
-        )
-        sys.exit(return_code)
-
-    time.sleep(1)
+signal.signal(signal.SIGTERM,handle_signal); signal.signal(signal.SIGINT,handle_signal)
+env={k:v for k,v in os.environ.items() if k not in {"BOT_TOKEN","CASHIER_TOKEN","GROQ_API_KEY","SYNC_CHANNEL_ID","SYNC_SECRET","OWNER_ID","OWNER_USERNAME","VERIFIER_BOT","DATABASE_URL","DATA_DIR","BOTHOST_USER_ENV","BOTHOST_BOT_TOKEN"} and not k.startswith("RAILWAY_")}
+env["PYTHONUNBUFFERED"]="1"
+try:
+    user_env=json.loads(os.environ.get("BOTHOST_USER_ENV","{}"))
+    if isinstance(user_env,dict): env.update({str(k):str(v) for k,v in user_env.items() if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*",str(k))})
+except Exception: pass
+if os.environ.get("BOTHOST_BOT_TOKEN"): env["BOT_TOKEN"]=os.environ["BOTHOST_BOT_TOKEN"]
+attempt=0
+while attempt<4:
+    process=subprocess.Popen([PYBIN,"-u",ENTRY_POINT],env=env,stdout=sys.stdout,stderr=subprocess.STDOUT)
+    while process.poll() is None: time.sleep(1)
+    ret=process.returncode
+    if ret==0: sys.exit(0)
+    attempt+=1
+    # Автоустановка отсутствующего модуля по последнему логу процесса.
+    missing=None
+    if os.path.exists("bot.log"):
+        txt=open("bot.log",encoding="utf-8",errors="ignore").read()[-12000:]
+        m=re.findall(r"No module named ['\"]([^'\"]+)",txt)
+        if m: missing=m[-1].split('.')[0]
+    if not missing: sys.exit(ret)
+    package=IMPORT_TO_PACKAGE.get(missing,missing)
+    print(f"[ BotHost ] Не хватает {missing}; устанавливаю {package}...",flush=True)
+    r=subprocess.run([PYBIN,"-m","pip","install",package,"--no-cache-dir","--disable-pip-version-check"])
+    if r.returncode: sys.exit(ret)
+sys.exit(ret)
 '''
 
-def write_wrapper(bot_dir, entry_point):
-    (bot_dir / "wrapper.py").write_text(
-        WRAPPER_CODE.replace("{{ENTRY_POINT}}", entry_point),
-        encoding="utf-8"
-    )
+def write_wrapper(bot_dir, entry_point): (bot_dir / "wrapper.py").write_text(WRAPPER_CODE.replace("{{ENTRY_POINT}}", entry_point), encoding="utf-8")
 
 async def start_user_bot(bot_id):
     lock=start_locks.setdefault(bot_id,asyncio.Lock())
@@ -467,7 +311,12 @@ async def start_user_bot(bot_id):
             current=running_bots.get(bot_id)
             if current and current.poll() is None: return True
             bot_dir=BOTS_DIR/f"bot_{bot_id}"; bot_dir.mkdir(parents=True,exist_ok=True)
-            ep=b[7] if len(b)>7 and b[7] else "user_bot.py"; write_wrapper(bot_dir,ep)
+            ep=resolve_entry_point(bot_id, bot_dir, b[7] if len(b)>7 else "")
+            if not ep:
+                logger.error("У бота #%s нет .py файла для запуска", bot_id)
+                _db_retry(lambda conn: conn.execute("UPDATE bots SET status='error' WHERE id=?", (bot_id,)))
+                return False
+            write_wrapper(bot_dir,ep)
             log_file=bot_dir/"bot.log"
             with open(log_file,"a",encoding="utf-8") as f: f.write(f"\n[{datetime.now().strftime('%d.%m %H:%M:%S')}] === ЗАПУСК БОТА #{bot_id} ===\n")
             env=os.environ.copy()
@@ -815,17 +664,39 @@ def safe_extract_zip(zf: zipfile.ZipFile, destination: Path):
         with zf.open(info) as src_f, open(target, "wb") as dst_f:
             shutil.copyfileobj(src_f, dst_f)
 
-def find_entry_point(bot_dir: Path) -> str:
-    candidates = []
-    preferred = {"main.py": 0, "bot.py": 1, "app.py": 2, "run.py": 3, "start.py": 4, "user_bot.py": 5}
+def get_python_files(bot_dir: Path) -> list[str]:
+    """Все возможные точки входа внутри папки бота."""
+    result = []
     for p in bot_dir.rglob("*.py"):
-        if p.name in preferred and p.name != "wrapper.py":
+        try:
             rel = p.relative_to(bot_dir)
-            candidates.append((preferred[p.name], len(rel.parts), str(rel)))
-    if not candidates:
-        return "user_bot.py"
-    candidates.sort(key=lambda x: (x[0], x[1], x[2]))
-    return candidates[0][2]
+        except ValueError:
+            continue
+        if any(part in {".venv", "__pycache__", ".git"} or part.startswith(".") for part in rel.parts):
+            continue
+        if rel.name == "wrapper.py":
+            continue
+        result.append(rel.as_posix())
+    preferred = {"main.py": 0, "bot.py": 1, "app.py": 2, "run.py": 3, "start.py": 4, "user_bot.py": 5, "cashier.py": 6}
+    result.sort(key=lambda x: (preferred.get(Path(x).name, 50), len(Path(x).parts), x.lower()))
+    return result
+
+def find_entry_point(bot_dir: Path) -> str:
+    files = get_python_files(bot_dir)
+    return files[0] if files else ""
+
+def resolve_entry_point(bot_id: int, bot_dir: Path, stored: str) -> str:
+    """Не даём старой записи user_bot.py ломать запуск, если такого файла уже нет."""
+    stored = (stored or "").replace("\\", "/").lstrip("/")
+    candidate = (bot_dir / stored).resolve() if stored else None
+    root = bot_dir.resolve()
+    if candidate and str(candidate).startswith(str(root) + os.sep) and candidate.is_file() and candidate.suffix.lower() == ".py":
+        return candidate.relative_to(root).as_posix()
+    detected = find_entry_point(bot_dir)
+    if detected:
+        update_bot_entry(bot_id, detected)
+        return detected
+    return ""
 
 # ═══════════════════════════════════════════════════════════════
 # 📤 ЗАГРУЗКА ФАЙЛОВ
@@ -912,7 +783,9 @@ async def handle_token(message: types.Message, state: FSMContext):
     data = await state.get_data()
     msg = await message.answer("⏳ <i>Распаковка проекта...</i>", parse_mode="HTML")
     try:
-        ep = "user_bot.py"
+        # Точку входа выбираем после распаковки проекта.
+        # Для одиночного .py сохраняем исходное имя файла, а не переименовываем его в user_bot.py.
+        ep = ""
         bid = save_bot(message.from_user.id, data["fname"], token, ep)
         bot_dir = BOTS_DIR / f"bot_{bid}"
         bot_dir.mkdir(parents=True, exist_ok=True)
@@ -925,21 +798,32 @@ async def handle_token(message: types.Message, state: FSMContext):
             with zipfile.ZipFile(dpath, "r") as z:
                 safe_extract_zip(z, bot_dir)
             dpath.unlink(missing_ok=True)
-            ep = find_entry_point(bot_dir)
         else:
-            dpath.rename(bot_dir / "user_bot.py")
+            # Одиночный файл остаётся под своим именем: например cashier.py, main.py и т.д.
+            target = bot_dir / data["fname"]
+            dpath.replace(target)
 
+        ep = find_entry_point(bot_dir)
         update_bot_entry(bid, ep)
-        write_wrapper(bot_dir, ep)
-        await msg.edit_text(
-            f"✅ <b>Бот #{bid} развёрнут!</b>\n"
-            f"🚀 Точка входа: <code>{html.escape(ep)}</code>\n\n"
-            f"Зайди в «🤖 Мои проекты» → ▶️ Запуск",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="🤖 Мои проекты", callback_data="mybots")]
-            ]),
-            parse_mode="HTML"
-        )
+        if ep:
+            write_wrapper(bot_dir, ep)
+        files = get_python_files(bot_dir)
+        if not ep:
+            await msg.edit_text(
+                f"⚠️ <b>Бот #{bid} загружен, но .py файл не найден.</b>\n\n"
+                "Добавь Python-файл через «📁 Файлы»."
+            )
+        else:
+            await msg.edit_text(
+                f"✅ <b>Бот #{bid} развёрнут!</b>\n"
+                f"🚀 Точка входа: <code>{html.escape(ep)}</code>\n\n"
+                f"Если нужно запустить другой .py файл — открой «🤖 Мои проекты» → бот → «📄 Точка входа».",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(text="📄 Точка входа", callback_data=f"entry:{bid}")],
+                    [InlineKeyboardButton(text="🤖 Мои проекты", callback_data="mybots")]
+                ]),
+                parse_mode="HTML"
+            )
     except Exception as e:
         await msg.edit_text(f"❌ Ошибка: {e}")
     await state.clear()
@@ -1195,6 +1079,7 @@ async def cb_bot_detail(call: types.CallbackQuery, state: FSMContext = None):
         [InlineKeyboardButton(text=f"🔄 Авто-рестарт: {auto_r}", callback_data=f"toggle_restart:{bid}")],
         [InlineKeyboardButton(text="📁 Файлы", callback_data=f"files:{bid}"),
          InlineKeyboardButton(text="⚙️ Переменные", callback_data=f"envmenu:{bid}")],
+        [InlineKeyboardButton(text="📄 Точка входа", callback_data=f"entry:{bid}")],
         [InlineKeyboardButton(text="🧠 AI Поиск ошибки", callback_data=f"ai:{bid}")],
         [InlineKeyboardButton(text="🗑 Удалить", callback_data=f"del:{bid}")]
     ]
@@ -1217,6 +1102,49 @@ async def cb_bot_detail(call: types.CallbackQuery, state: FSMContext = None):
         await call.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=kb), parse_mode="HTML")
     except Exception:
         await call.message.answer(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=kb), parse_mode="HTML")
+
+@dp.callback_query(F.data.startswith("entry:"))
+async def cb_entry_menu(call: types.CallbackQuery):
+    bid = int(call.data.split(":")[1])
+    b = get_bot(bid)
+    if not b or (b[1] != call.from_user.id and not is_admin(call.from_user.id)):
+        return await call.answer("❌ Нет доступа", show_alert=True)
+    bot_dir = BOTS_DIR / f"bot_{bid}"
+    files = get_python_files(bot_dir)
+    if not files:
+        return await call.answer("❌ В боте нет .py файлов", show_alert=True)
+    current = b[7] if len(b) > 7 else ""
+    rows = []
+    for i, path in enumerate(files[:80]):
+        mark = "✅ " if path == current else ""
+        rows.append([InlineKeyboardButton(text=f"{mark}🐍 {path}"[:64], callback_data=f"entryset:{bid}:{i}")])
+    back = "bot:%s" % bid
+    rows.append([InlineKeyboardButton(text="« Назад", callback_data=back)])
+    await call.message.edit_text(
+        f"📄 <b>Выберите точку входа для бота #{bid}</b>\n\n"
+        "Именно этот .py файл BotHost будет запускать.\n"
+        f"Текущая: <code>{html.escape(current or 'не выбрана')}</code>",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
+        parse_mode="HTML"
+    )
+    await call.answer()
+
+@dp.callback_query(F.data.startswith("entryset:"))
+async def cb_entry_set(call: types.CallbackQuery):
+    _, bid_s, idx_s = call.data.split(":", 2)
+    bid, idx = int(bid_s), int(idx_s)
+    b = get_bot(bid)
+    if not b or (b[1] != call.from_user.id and not is_admin(call.from_user.id)):
+        return await call.answer("❌ Нет доступа", show_alert=True)
+    bot_dir = BOTS_DIR / f"bot_{bid}"
+    files = get_python_files(bot_dir)
+    if idx < 0 or idx >= len(files):
+        return await call.answer("❌ Список файлов изменился. Открой выбор заново.", show_alert=True)
+    ep = files[idx]
+    update_bot_entry(bid, ep)
+    write_wrapper(bot_dir, ep)
+    await call.answer("✅ Точка входа изменена")
+    await cb_bot_detail(call, None)
 
 @dp.callback_query(F.data.startswith("toggle_restart:"))
 async def cb_toggle_restart(call: types.CallbackQuery):
