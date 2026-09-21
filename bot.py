@@ -233,7 +233,7 @@ dp.message.middleware(BanMiddleware()); dp.callback_query.middleware(BanMiddlewa
 # ═══════════════════════════════════════════════════════════════
 # 🚀 ОБЁРТКА И ЗАПУСК
 # ═══════════════════════════════════════════════════════════════
-WRAPPER_CODE = '''#!/usr/bin/env python3
+WRAPPER_CODE = r'''#!/usr/bin/env python3
 import os, sys, subprocess, time, signal, hashlib, re, venv, json
 ENTRY_POINT = "{{ENTRY_POINT}}"
 print(f"\n[ BotHost ] Подготовка проекта... Точка входа: {ENTRY_POINT}", flush=True)
