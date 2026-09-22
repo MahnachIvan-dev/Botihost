@@ -18,6 +18,7 @@ import zipfile
 import shutil
 import time
 import atexit
+import threading
 import hmac
 import hashlib
 import json
@@ -85,14 +86,18 @@ if GROQ_AVAILABLE and GROQ_API_KEY:
 # 💾 БАЗА ДАННЫХ
 # ═══════════════════════════════════════════════════════════════
 def _db_connect():
-    conn = sqlite3.connect(DB_PATH, timeout=30, check_same_thread=False)
+    conn = sqlite3.connect(DB_PATH, timeout=5, check_same_thread=False)
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA busy_timeout=5000")
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA synchronous=NORMAL")
-    conn.execute("PRAGMA busy_timeout=30000")
     return conn
 
-def _db_retry(fn, attempts=8):
+
+def _db_retry(fn, attempts=10):
+    """Run a DB operation with short bounded retries.
+    The cashier has its own storage, so BotHost's DB is no longer shared with it.
+    """
     last = None
     for i in range(attempts):
         conn = None
@@ -103,22 +108,35 @@ def _db_retry(fn, attempts=8):
             return result
         except sqlite3.OperationalError as e:
             last = e
-            if "locked" not in str(e).lower() and "busy" not in str(e).lower():
+            text_err = str(e).lower()
+            if "locked" not in text_err and "busy" not in text_err:
                 raise
             if conn:
-                try: conn.rollback()
-                except Exception: pass
-            time.sleep(min(0.25 * (2 ** i), 3.0))
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
+            time.sleep(min(0.10 * (i + 1), 0.8))
         finally:
             if conn:
                 conn.close()
     raise last
+
+
+def _db_read(fn):
+    conn = _db_connect()
+    try:
+        return fn(conn)
+    finally:
+        conn.close()
+
 
 def init_db():
     def setup(conn):
         c = conn.cursor()
         c.execute("PRAGMA journal_mode=WAL")
         c.execute("PRAGMA synchronous=NORMAL")
+        c.execute("PRAGMA busy_timeout=5000")
         c.execute("CREATE TABLE IF NOT EXISTS users (user_id INTEGER PRIMARY KEY, username TEXT, full_name TEXT, is_admin INTEGER DEFAULT 0, is_banned INTEGER DEFAULT 0, created_at TEXT)")
         c.execute("CREATE TABLE IF NOT EXISTS slots (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, plan TEXT, expires_at TEXT, created_at TEXT, gift_id TEXT)")
         c.execute("CREATE TABLE IF NOT EXISTS bots (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, filename TEXT, bot_token TEXT, status TEXT DEFAULT 'stopped', created_at TEXT, is_frozen INTEGER DEFAULT 0, entry_point TEXT DEFAULT 'user_bot.py', auto_restart INTEGER DEFAULT 0, env_vars TEXT DEFAULT '{}')")
@@ -126,8 +144,6 @@ def init_db():
         c.execute("CREATE TABLE IF NOT EXISTS promocodes (id INTEGER PRIMARY KEY AUTOINCREMENT, code TEXT UNIQUE, plan TEXT, uses_left INTEGER, created_at TEXT)")
         c.execute("CREATE TABLE IF NOT EXISTS used_promos (user_id INTEGER, promo_id INTEGER, UNIQUE(user_id, promo_id))")
         c.execute("CREATE TABLE IF NOT EXISTS auto_grants (grant_id TEXT PRIMARY KEY, user_id INTEGER NOT NULL, plan TEXT NOT NULL, created_at TEXT NOT NULL)")
-        # Миграции старых БД: добавляем колонки независимо от того,
-        # когда была создана таблица bots.
         cols = {row[1] for row in c.execute("PRAGMA table_info(bots)").fetchall()}
         if "entry_point" not in cols:
             c.execute("ALTER TABLE bots ADD COLUMN entry_point TEXT DEFAULT 'user_bot.py'")
@@ -135,90 +151,225 @@ def init_db():
             c.execute("ALTER TABLE bots ADD COLUMN auto_restart INTEGER DEFAULT 0")
         if "env_vars" not in cols:
             c.execute("ALTER TABLE bots ADD COLUMN env_vars TEXT DEFAULT '{}'")
-    _db_retry(setup)
+
+    _db_retry(setup, attempts=20)
+
 
 def get_db():
     return _db_connect()
 
+
 def create_user(uid, uname, fname=""):
+    _db_retry(lambda conn: conn.execute(
+        """INSERT INTO users (user_id, username, full_name, created_at)
+           VALUES (?, ?, ?, ?)
+           ON CONFLICT(user_id) DO UPDATE SET username=excluded.username, full_name=excluded.full_name""",
+        (uid, uname, fname, datetime.now().isoformat())))
+
+
+def get_user(uid):
+    return _db_read(lambda conn: conn.execute("SELECT * FROM users WHERE user_id = ?", (uid,)).fetchone())
+
+
+def get_all_users():
+    return _db_read(lambda conn: conn.execute("SELECT * FROM users ORDER BY created_at DESC").fetchall())
+
+
+def find_user_by_username(uname):
+    row = _db_read(lambda conn: conn.execute("SELECT user_id FROM users WHERE LOWER(username) = ?", (uname.lstrip("@").lower(),)).fetchone())
+    return row[0] if row else None
+
+
+def is_user_banned(uid):
+    if uid == OWNER_ID:
+        return False
+    row = get_user(uid)
+    return bool(row and row[4])
+
+
+def ban_user(uid):
+    _db_retry(lambda conn: conn.execute("UPDATE users SET is_banned = 1 WHERE user_id = ?", (uid,)))
+
+
+def unban_user(uid):
+    _db_retry(lambda conn: conn.execute("UPDATE users SET is_banned = 0 WHERE user_id = ?", (uid,)))
+
+
+def is_admin(uid):
+    if uid == OWNER_ID:
+        return True
+    row = get_user(uid)
+    return bool(row and row[3])
+
+
+def add_admin(uid):
     def op(conn):
-        conn.execute("""INSERT INTO users (user_id, username, full_name, created_at)
-            VALUES (?, ?, ?, ?)
-            ON CONFLICT(user_id) DO UPDATE SET username=excluded.username, full_name=excluded.full_name""",
-            (uid, uname, fname, datetime.now().isoformat()))
+        conn.execute("INSERT OR IGNORE INTO users (user_id, created_at) VALUES (?, ?)", (uid, datetime.now().isoformat()))
+        conn.execute("UPDATE users SET is_admin = 1 WHERE user_id = ?", (uid,))
     _db_retry(op)
 
-def get_user(uid): conn = get_db(); c = conn.cursor(); c.execute("SELECT * FROM users WHERE user_id = ?", (uid,)); r = c.fetchone(); conn.close(); return r
-def get_all_users(): conn = get_db(); c = conn.cursor(); c.execute("SELECT * FROM users ORDER BY created_at DESC"); r = c.fetchall(); conn.close(); return r
-def find_user_by_username(uname): conn = get_db(); c = conn.cursor(); c.execute("SELECT user_id FROM users WHERE LOWER(username) = ?", (uname.lstrip("@").lower(),)); r = c.fetchone(); conn.close(); return r[0] if r else None
-def is_user_banned(uid): return False if uid == OWNER_ID else bool((get_user(uid) or [0,0,0,0,0])[4])
-def ban_user(uid): conn = get_db(); c = conn.cursor(); c.execute("UPDATE users SET is_banned = 1 WHERE user_id = ?", (uid,)); conn.commit(); conn.close()
-def unban_user(uid): conn = get_db(); c = conn.cursor(); c.execute("UPDATE users SET is_banned = 0 WHERE user_id = ?", (uid,)); conn.commit(); conn.close()
-def is_admin(uid): return True if uid == OWNER_ID else bool((get_user(uid) or [0,0,0,0])[3])
-def add_admin(uid): conn = get_db(); c = conn.cursor(); c.execute("INSERT OR IGNORE INTO users (user_id, created_at) VALUES (?, ?)", (uid, datetime.now().isoformat())); c.execute("UPDATE users SET is_admin = 1 WHERE user_id = ?", (uid,)); conn.commit(); conn.close()
-def remove_admin(uid): conn = get_db(); c = conn.cursor(); c.execute("UPDATE users SET is_admin = 0 WHERE user_id = ?", (uid,)); conn.commit(); conn.close()
-def get_all_admins(): conn = get_db(); c = conn.cursor(); c.execute("SELECT user_id, username, full_name FROM users WHERE is_admin = 1 AND user_id != ?", (OWNER_ID,)); r = c.fetchall(); conn.close(); return r
+
+def remove_admin(uid):
+    _db_retry(lambda conn: conn.execute("UPDATE users SET is_admin = 0 WHERE user_id = ?", (uid,)))
+
+
+def get_all_admins():
+    return _db_read(lambda conn: conn.execute("SELECT user_id, username, full_name FROM users WHERE is_admin = 1 AND user_id != ?", (OWNER_ID,)).fetchall())
+
+
 def has_active_slot(uid):
-    if is_admin(uid): return True
-    conn = get_db(); c = conn.cursor(); c.execute("SELECT COUNT(*) FROM slots WHERE user_id = ? AND expires_at > ?", (uid, datetime.now().isoformat())); r = c.fetchone()[0]; conn.close(); return r > 0
+    if is_admin(uid):
+        return True
+    now = datetime.now().isoformat()
+    row = _db_read(lambda conn: conn.execute("SELECT COUNT(*) FROM slots WHERE user_id = ? AND expires_at > ?", (uid, now)).fetchone())
+    return bool(row and row[0] > 0)
+
+
 def get_active_slots(uid):
-    if is_admin(uid): return [(0, uid, "month", "2099-12-31", datetime.now().isoformat(), "admin")]
-    conn = get_db(); c = conn.cursor(); c.execute("SELECT * FROM slots WHERE user_id = ? AND expires_at > ?", (uid, datetime.now().isoformat())); r = c.fetchall(); conn.close(); return r
+    if is_admin(uid):
+        return [(0, uid, "month", "2099-12-31", datetime.now().isoformat(), "admin")]
+    now = datetime.now().isoformat()
+    return _db_read(lambda conn: conn.execute("SELECT * FROM slots WHERE user_id = ? AND expires_at > ?", (uid, now)).fetchall())
+
+
 def create_slot(uid, plan):
-    exp = datetime.now() + timedelta(days=PLANS[plan]["days"])
-    conn = get_db(); c = conn.cursor(); c.execute("INSERT INTO slots (user_id, plan, expires_at, created_at) VALUES (?, ?, ?, ?)", (uid, plan, exp.isoformat(), datetime.now().isoformat())); conn.commit(); conn.close()
-def save_bot(uid, fname, token, ep="user_bot.py"): conn = get_db(); c = conn.cursor(); c.execute("INSERT INTO bots (user_id, filename, bot_token, created_at, entry_point) VALUES (?, ?, ?, ?, ?)", (uid, fname, token, datetime.now().isoformat(), ep)); bid = c.lastrowid; conn.commit(); conn.close(); return bid
-def get_user_bots(uid): conn = get_db(); c = conn.cursor(); c.execute("SELECT * FROM bots WHERE user_id = ?", (uid,)); r = c.fetchall(); conn.close(); return r
-def get_bot(bid): conn = get_db(); c = conn.cursor(); c.execute("SELECT * FROM bots WHERE id = ?", (bid,)); r = c.fetchone(); conn.close(); return r
-def get_all_bots(): conn = get_db(); c = conn.cursor(); c.execute("SELECT * FROM bots"); r = c.fetchall(); conn.close(); return r
-def update_bot_entry(bid, ep): conn = get_db(); c = conn.cursor(); c.execute("UPDATE bots SET entry_point = ? WHERE id = ?", (ep, bid)); conn.commit(); conn.close()
-def toggle_auto_restart(bid, val): conn = get_db(); c = conn.cursor(); c.execute("UPDATE bots SET auto_restart = ? WHERE id = ?", (val, bid)); conn.commit(); conn.close()
+    now = datetime.now()
+    exp = now + timedelta(days=PLANS[plan]["days"])
+    _db_retry(lambda conn: conn.execute("INSERT INTO slots (user_id, plan, expires_at, created_at) VALUES (?, ?, ?, ?)", (uid, plan, exp.isoformat(), now.isoformat())))
+
+
+def save_bot(uid, fname, token, ep="user_bot.py"):
+    def op(conn):
+        cur = conn.execute("INSERT INTO bots (user_id, filename, bot_token, created_at, entry_point) VALUES (?, ?, ?, ?, ?)", (uid, fname, token, datetime.now().isoformat(), ep))
+        return cur.lastrowid
+    return _db_retry(op)
+
+
+def get_user_bots(uid):
+    return _db_read(lambda conn: conn.execute("SELECT * FROM bots WHERE user_id = ?", (uid,)).fetchall())
+
+
+def get_bot(bid):
+    return _db_read(lambda conn: conn.execute("SELECT * FROM bots WHERE id = ?", (bid,)).fetchone())
+
+
+def get_all_bots():
+    return _db_read(lambda conn: conn.execute("SELECT * FROM bots").fetchall())
+
+
+def update_bot_entry(bid, ep):
+    _db_retry(lambda conn: conn.execute("UPDATE bots SET entry_point = ? WHERE id = ?", (ep, bid)))
+
+
+def toggle_auto_restart(bid, val):
+    _db_retry(lambda conn: conn.execute("UPDATE bots SET auto_restart = ? WHERE id = ?", (val, bid)))
+
+
 def get_bot_env(bid):
     b = get_bot(bid)
-    if not b or len(b) < 10: return {}
-    try: return json.loads(b[9] or "{}")
-    except Exception: return {}
+    if not b or len(b) < 10:
+        return {}
+    try:
+        return json.loads(b[9] or "{}")
+    except Exception:
+        return {}
+
 
 def set_bot_env(bid, env_vars):
     payload = json.dumps(env_vars, ensure_ascii=False)
     _db_retry(lambda conn: conn.execute("UPDATE bots SET env_vars = ? WHERE id = ?", (payload, bid)))
 
-def freeze_bot(bid): conn = get_db(); c = conn.cursor(); c.execute("UPDATE bots SET is_frozen = 1 WHERE id = ?", (bid,)); conn.commit(); conn.close()
-def unfreeze_bot(bid): conn = get_db(); c = conn.cursor(); c.execute("UPDATE bots SET is_frozen = 0 WHERE id = ?", (bid,)); conn.commit(); conn.close()
-def delete_bot_record(bid): conn = get_db(); c = conn.cursor(); c.execute("DELETE FROM bots WHERE id = ?", (bid,)); conn.commit(); conn.close()
-def create_payment_request(uid, uname, fname, plan): conn = get_db(); c = conn.cursor(); c.execute("INSERT INTO payment_requests (user_id, username, full_name, plan, created_at) VALUES (?, ?, ?, ?, ?)", (uid, uname, fname, plan, datetime.now().isoformat())); rid = c.lastrowid; conn.commit(); conn.close(); return rid
-def get_pending_requests(): conn = get_db(); c = conn.cursor(); c.execute("SELECT * FROM payment_requests WHERE status = 'pending' ORDER BY created_at ASC"); r = c.fetchall(); conn.close(); return r
-def get_payment_request(rid): conn = get_db(); c = conn.cursor(); c.execute("SELECT * FROM payment_requests WHERE id = ?", (rid,)); r = c.fetchone(); conn.close(); return r
-def approve_payment(rid): conn = get_db(); c = conn.cursor(); c.execute("UPDATE payment_requests SET status = 'approved', processed_at = ? WHERE id = ?", (datetime.now().isoformat(), rid)); conn.commit(); conn.close()
-def reject_payment(rid): conn = get_db(); c = conn.cursor(); c.execute("UPDATE payment_requests SET status = 'rejected', processed_at = ? WHERE id = ?", (datetime.now().isoformat(), rid)); conn.commit(); conn.close()
-def user_has_pending_request(uid): conn = get_db(); c = conn.cursor(); c.execute("SELECT COUNT(*) FROM payment_requests WHERE user_id = ? AND status = 'pending'", (uid,)); r = c.fetchone()[0]; conn.close(); return r > 0
+
+def freeze_bot(bid):
+    _db_retry(lambda conn: conn.execute("UPDATE bots SET is_frozen = 1 WHERE id = ?", (bid,)))
+
+
+def unfreeze_bot(bid):
+    _db_retry(lambda conn: conn.execute("UPDATE bots SET is_frozen = 0 WHERE id = ?", (bid,)))
+
+
+def delete_bot_record(bid):
+    _db_retry(lambda conn: conn.execute("DELETE FROM bots WHERE id = ?", (bid,)))
+
+
+def create_payment_request(uid, uname, fname, plan):
+    def op(conn):
+        cur = conn.execute("INSERT INTO payment_requests (user_id, username, full_name, plan, created_at) VALUES (?, ?, ?, ?, ?)", (uid, uname, fname, plan, datetime.now().isoformat()))
+        return cur.lastrowid
+    return _db_retry(op)
+
+
+def get_pending_requests():
+    return _db_read(lambda conn: conn.execute("SELECT * FROM payment_requests WHERE status = 'pending' ORDER BY created_at ASC").fetchall())
+
+
+def get_payment_request(rid):
+    return _db_read(lambda conn: conn.execute("SELECT * FROM payment_requests WHERE id = ?", (rid,)).fetchone())
+
+
+def approve_payment(rid):
+    _db_retry(lambda conn: conn.execute("UPDATE payment_requests SET status = 'approved', processed_at = ? WHERE id = ?", (datetime.now().isoformat(), rid)))
+
+
+def reject_payment(rid):
+    _db_retry(lambda conn: conn.execute("UPDATE payment_requests SET status = 'rejected', processed_at = ? WHERE id = ?", (datetime.now().isoformat(), rid)))
+
+
+def user_has_pending_request(uid):
+    row = _db_read(lambda conn: conn.execute("SELECT COUNT(*) FROM payment_requests WHERE user_id = ? AND status = 'pending'", (uid,)).fetchone())
+    return bool(row and row[0] > 0)
+
+
 def create_promo(code, plan, uses):
-    try: conn = get_db(); c = conn.cursor(); c.execute("INSERT INTO promocodes (code, plan, uses_left, created_at) VALUES (?, ?, ?, ?)", (code, plan, uses, datetime.now().isoformat())); conn.commit(); conn.close(); return True
-    except: return False
-def get_all_promos(): conn = get_db(); c = conn.cursor(); c.execute("SELECT id, code, plan, uses_left FROM promocodes WHERE uses_left > 0"); r = c.fetchall(); conn.close(); return r
-def delete_promo(pid): conn = get_db(); c = conn.cursor(); c.execute("DELETE FROM promocodes WHERE id = ?", (pid,)); conn.commit(); conn.close()
+    try:
+        _db_retry(lambda conn: conn.execute("INSERT INTO promocodes (code, plan, uses_left, created_at) VALUES (?, ?, ?, ?)", (code, plan, uses, datetime.now().isoformat())))
+        return True
+    except sqlite3.IntegrityError:
+        return False
+
+
+def get_all_promos():
+    return _db_read(lambda conn: conn.execute("SELECT id, code, plan, uses_left FROM promocodes WHERE uses_left > 0").fetchall())
+
+
+def delete_promo(pid):
+    _db_retry(lambda conn: conn.execute("DELETE FROM promocodes WHERE id = ?", (pid,)))
+
+
 def use_promo(uid, code):
-    conn = get_db(); c = conn.cursor(); c.execute("SELECT id, plan, uses_left FROM promocodes WHERE code = ?", (code,)); p = c.fetchone()
-    if not p or p[2] <= 0: conn.close(); return False, "❌ Промокод не найден или закончился."
-    c.execute("SELECT 1 FROM used_promos WHERE user_id = ? AND promo_id = ?", (uid, p[0]))
-    if c.fetchone(): conn.close(); return False, "⚠️ Ты уже использовал этот промокод."
-    c.execute("UPDATE promocodes SET uses_left = uses_left - 1 WHERE id = ?", (p[0],)); c.execute("INSERT INTO used_promos (user_id, promo_id) VALUES (?, ?)", (uid, p[0])); conn.commit(); conn.close(); create_slot(uid, p[1]); return True, p[1]
+    def op(conn):
+        c = conn.cursor()
+        p = c.execute("SELECT id, plan, uses_left FROM promocodes WHERE code = ?", (code,)).fetchone()
+        if not p or p[2] <= 0:
+            return False, "❌ Промокод не найден или закончился."
+        if c.execute("SELECT 1 FROM used_promos WHERE user_id = ? AND promo_id = ?", (uid, p[0])).fetchone():
+            return False, "⚠️ Ты уже использовал этот промокод."
+        c.execute("UPDATE promocodes SET uses_left = uses_left - 1 WHERE id = ? AND uses_left > 0", (p[0],))
+        if c.rowcount != 1:
+            return False, "❌ Промокод уже закончился."
+        c.execute("INSERT INTO used_promos (user_id, promo_id) VALUES (?, ?)", (uid, p[0]))
+        return True, p[1]
+    ok, value = _db_retry(op)
+    if ok:
+        create_slot(uid, value)
+    return ok, value
+
 
 def get_stats():
-    conn = get_db(); c = conn.cursor()
-    r = {
-        "users": c.execute("SELECT COUNT(*) FROM users").fetchone()[0],
-        "banned": c.execute("SELECT COUNT(*) FROM users WHERE is_banned = 1").fetchone()[0],
-        "admins": c.execute("SELECT COUNT(*) FROM users WHERE is_admin = 1").fetchone()[0],
-        "slots": c.execute("SELECT COUNT(*) FROM slots WHERE expires_at > ?", (datetime.now().isoformat(),)).fetchone()[0],
-        "bots": c.execute("SELECT COUNT(*) FROM bots").fetchone()[0],
-        "frozen": c.execute("SELECT COUNT(*) FROM bots WHERE is_frozen = 1").fetchone()[0],
-        "pending": c.execute("SELECT COUNT(*) FROM payment_requests WHERE status = 'pending'").fetchone()[0],
-        "running": len(running_bots)
-    }
-    conn.close(); return r
+    def read(conn):
+        c = conn.cursor()
+        return {
+            "users": c.execute("SELECT COUNT(*) FROM users").fetchone()[0],
+            "banned": c.execute("SELECT COUNT(*) FROM users WHERE is_banned = 1").fetchone()[0],
+            "admins": c.execute("SELECT COUNT(*) FROM users WHERE is_admin = 1").fetchone()[0],
+            "slots": c.execute("SELECT COUNT(*) FROM slots WHERE expires_at > ?", (datetime.now().isoformat(),)).fetchone()[0],
+            "bots": c.execute("SELECT COUNT(*) FROM bots").fetchone()[0],
+            "frozen": c.execute("SELECT COUNT(*) FROM bots WHERE is_frozen = 1").fetchone()[0],
+            "pending": c.execute("SELECT COUNT(*) FROM payment_requests WHERE status = 'pending'").fetchone()[0],
+            "running": len(running_bots),
+        }
+    return _db_read(read)
 
-# ═══════════════════════════════════════════════════════════════
 # 🛡 ГЛОБАЛЬНЫЙ БАН
 # ═══════════════════════════════════════════════════════════════
 class BanMiddleware(BaseMiddleware):
@@ -1829,7 +1980,7 @@ async def main():
         logger.warning("SYNC_SECRET не задан — автоматическая выдача через кассира отключена.")
     acquire_instance_lock()
     logger.info("=" * 50)
-    logger.info("🤖 BotHost v8.0 запускается...")
+    logger.info("🤖 BotHost запускается | pid=%s | db=%s", os.getpid(), DB_PATH)
     logger.info(f"👤 Владелец: {OWNER_ID}")
     logger.info(f"🔗 Кассир: @{VERIFIER_BOT_USERNAME}")
     logger.info(f"📢 SYNC канал: {SYNC_CHANNEL_ID}")
@@ -1852,18 +2003,41 @@ async def main():
     cashier_task = None
     if os.environ.get("CASHIER_TOKEN", "").strip():
         async def run_internal_cashier():
-            try:
-                cashier = importlib.import_module("cashier")
-                logger.info("💳 Внутренний кассир запускается в том же Railway-сервисе...")
-                await cashier.main()
-            except Exception:
-                logger.exception("❌ Внутренний кассир не запустился")
-        cashier_task = asyncio.create_task(run_internal_cashier())
+            # Кассир никогда не должен иметь возможность уронить основной BotHost.
+            while True:
+                try:
+                    cashier = importlib.import_module("cashier")
+                    logger.info("💳 Внутренний кассир запускается в том же Railway-сервисе...")
+                    await cashier.main()
+                    logger.warning("⚠️ Кассир завершил polling без исключения; перезапуск через 3 сек")
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    logger.exception("❌ Внутренний кассир остановился; перезапуск через 5 сек")
+                await asyncio.sleep(5)
+        cashier_task = asyncio.create_task(run_internal_cashier(), name="internal-cashier")
     else:
         logger.warning("⚠️ CASHIER_TOKEN не задан — внутренний кассир отключён")
 
     try:
-        await dp.start_polling(bot, allowed_updates=["message", "callback_query", "channel_post"])
+        # Ошибки сети Telegram не должны завершать основной процесс Railway.
+        # Conflict/Unauthorized считаем фатальными: они означают неверную конфигурацию.
+        while True:
+            try:
+                await dp.start_polling(bot, allowed_updates=["message", "callback_query", "channel_post"])
+                logger.warning("⚠️ Основной polling завершился без исключения; перезапуск через 3 сек")
+                await asyncio.sleep(3)
+            except asyncio.CancelledError:
+                raise
+            except TelegramConflictError:
+                logger.exception("❌ TelegramConflictError: BOT_TOKEN уже используется другим polling-процессом")
+                raise
+            except TelegramUnauthorizedError:
+                logger.exception("❌ TelegramUnauthorizedError: BOT_TOKEN недействителен")
+                raise
+            except Exception:
+                logger.exception("❌ Основной BotHost polling упал; перезапуск через 5 сек")
+                await asyncio.sleep(5)
     finally:
         if cashier_task:
             cashier_task.cancel()
