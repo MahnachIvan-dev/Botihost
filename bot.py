@@ -413,7 +413,24 @@ if req_files and req_hash != old_hash:
         r=subprocess.run([PYBIN,"-m","pip","install","-r",rf,"--no-cache-dir","--disable-pip-version-check"])
         if r.returncode: sys.exit(r.returncode)
     open(marker,"w",encoding="utf-8").write(req_hash)
-IMPORT_TO_PACKAGE={"PIL":"Pillow","cv2":"opencv-python","bs4":"beautifulsoup4","dotenv":"python-dotenv","yaml":"PyYAML","Crypto":"pycryptodome","dateutil":"python-dateutil","jwt":"PyJWT","multipart":"python-multipart","fitz":"PyMuPDF","openai":"openai","groq":"groq","aiogram":"aiogram","discord":"discord.py","requests":"requests","aiohttp":"aiohttp","flask":"flask","fastapi":"fastapi","uvicorn":"uvicorn","pydantic":"pydantic","sqlalchemy":"sqlalchemy","redis":"redis","pymongo":"pymongo"}
+IMPORT_TO_PACKAGE={"telegram":"python-telegram-bot","PIL":"Pillow","cv2":"opencv-python","bs4":"beautifulsoup4","dotenv":"python-dotenv","yaml":"PyYAML","Crypto":"pycryptodome","dateutil":"python-dateutil","jwt":"PyJWT","multipart":"python-multipart","fitz":"PyMuPDF","openai":"openai","groq":"groq","aiogram":"aiogram","discord":"discord.py","requests":"requests","aiohttp":"aiohttp","flask":"flask","fastapi":"fastapi","uvicorn":"uvicorn","pydantic":"pydantic","sqlalchemy":"sqlalchemy","redis":"redis","pymongo":"pymongo"}
+
+def ensure_telegram_package():
+    # `telegram` on PyPI (0.0.1) is not python-telegram-bot.
+    # A bot using `from telegram import ...` needs python-telegram-bot.
+    try:
+        import telegram
+        if not hasattr(telegram, "Bot"):
+            print("[ BotHost ] Обнаружен неправильный пакет telegram; заменяю на python-telegram-bot...", flush=True)
+            subprocess.run([PYBIN,"-m","pip","uninstall","-y","telegram"], stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT)
+            r=subprocess.run([PYBIN,"-m","pip","install","python-telegram-bot","--no-cache-dir","--disable-pip-version-check"])
+            if r.returncode:
+                print("[ BotHost ] Не удалось установить python-telegram-bot", flush=True)
+                sys.exit(r.returncode)
+    except ImportError:
+        pass
+
+ensure_telegram_package()
 process=None
 def handle_signal(signum,frame):
     global process
