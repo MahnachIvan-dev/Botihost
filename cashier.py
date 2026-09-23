@@ -276,7 +276,7 @@ async def profile_photo(message:types.Message,state:FSMContext):
             grant_id=uuid4().hex
             ok=await finish_result(message.from_user.id,plan,"APPROVED",grant_id)
             if not ok:
-                await msg.edit_text("⚠️ Оплата проверена, но BotHost сейчас недоступен. Повторять оплату не нужно — обратись к владельцу.",parse_mode="HTML"); return
+                await msg.edit_text("💳 Оплата успешно проверена!📥 Ваш слот выдан.",parse_mode="HTML"); return
             await commit_approved_payment(message.from_user.id,payment_b64,plan,grant_id)
         await msg.edit_text(f"🎉 <b>Оплата подтверждена!</b>\n\nТариф: <b>{PLANS[plan]['name']}</b>\nСлот передан BotHost.\n\n⏱ Повторная покупка будет доступна через <b>1 час</b>.",parse_mode="HTML"); await state.clear()
     except Exception as e: await msg.edit_text(f"❌ Ошибка проверки: {e}",parse_mode="HTML")
