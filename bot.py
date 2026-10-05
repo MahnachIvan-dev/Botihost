@@ -121,7 +121,7 @@ elif _cashier_env in ("0", "false", "no", "off", "выкл"):
 else:
     INTERNAL_CASHIER_MODE = "auto"
 INTERNAL_CASHIER = INTERNAL_CASHIER_MODE  # для обратной совместимости и логов
-BOTHOST_VERSION = "9.6"
+BOTHOST_VERSION = "9.7"
 
 DATA_DIR = Path(os.environ.get("DATA_DIR", "/app/data"))
 BOTS_DIR = DATA_DIR / "bots"
@@ -150,9 +150,9 @@ BASE_PLANS = {
     "2weeks": {"name": "2 недели", "stars": 25, "days": 14, "kind": "bot",  "emoji": "🗓"},
     "month":  {"name": "Месяц",    "stars": 50, "days": 30, "kind": "bot",  "emoji": "💎"},
     # 🚀 Хостинг без лимита ботов
-    "host_week":   {"name": "Хостинг · Неделя",   "stars": 50,  "days": 7,  "kind": "host", "emoji": "🚀"},
-    "host_2weeks": {"name": "Хостинг · 2 недели", "stars": 100,  "days": 14, "kind": "host", "emoji": "🛰"},
-    "host_month":  {"name": "Хостинг · Месяц",    "stars": 100, "days": 30, "kind": "host", "emoji": "🌌"},
+    "host_week":   {"name": "Хостинг · Неделя",   "stars": 39,  "days": 7,  "kind": "host", "emoji": "🚀"},
+    "host_2weeks": {"name": "Хостинг · 2 недели", "stars": 65,  "days": 14, "kind": "host", "emoji": "🛰"},
+    "host_month":  {"name": "Хостинг · Месяц",    "stars": 130, "days": 30, "kind": "host", "emoji": "🌌"},
 }
 
 KINDS = {
@@ -3835,10 +3835,12 @@ async def cb_adm_broadcast(call: types.CallbackQuery, state: FSMContext):
         "премиум-эмодзи сохраняются.\n\n"
         "• 🖼 фото, 🎥 видео, 🎵 аудио, 🎙 голос, 📄 документы, GIF, стикеры\n"
         "• 📚 альбом (несколько фото/видео одним постом) — можно\n"
-        "• 😀 премиум-эмодзи и кастомные эмодзи — можно\n"
-        "• 🔗 сообщение без ссылки «переслано от» (не пересылка, а копия)\n\n"
-        "Сначала бот покажет <b>предпросмотр тебе</b> — как это увидят люди. "
-        "Потом подтвердишь отправку.\n\n"
+        "• 🔗 без ссылки «переслано от» (копия, а не пересылка)\n\n"
+        "😀 <b>Про премиум-эмодзи:</b> это объекты Telegram, а не символы текста. "
+        "Боту запрещено <i>использовать</i> кастомные эмодзи, поэтому <b>копия их теряет</b>, "
+        "а <b>пересылка сохраняет</b> (но добавляет подпись «Переслано от …»).\n"
+        "Бот покажет оба варианта — выберешь, где эмодзи на месте.\n\n"
+        "Сначала бот покажет <b>предпросмотр тебе</b>, и только потом спросит подтверждение.\n\n"
         "❌ /cancel — отмена",
         parse_mode="HTML")
 
@@ -3873,40 +3875,64 @@ async def _flush_album(gid, chat_id, state, delay=1.5):
         logger.exception("album collect error")
 
 
-async def show_broadcast_preview(chat_id, msg_ids, state):
+async def show_broadcast_preview(chat_id, msg_ids, state, mode="copy"):
     """Показывает владельцу копию будущей рассылки и ждёт подтверждения."""
     await state.set_state(AdminStates.broadcast)
     await state.update_data(bc_chat=chat_id, bc_ids=list(msg_ids))
     preview_ok = True
     try:
-        if len(msg_ids) > 1 and hasattr(bot, "copy_messages"):
-            await bot.copy_messages(chat_id, from_chat_id=chat_id, message_ids=msg_ids)
-        else:
-            await bot.copy_message(chat_id, from_chat_id=chat_id, message_id=msg_ids[0])
+        await send_broadcast_message(chat_id, chat_id, list(msg_ids), mode=mode)
     except Exception as e:
         preview_ok = False
-        logger.warning("Не удалось показать предпросмотр копией: %s", e)
-        try:
-            await bot.forward_messages(chat_id, from_chat_id=chat_id, message_ids=msg_ids)
-        except Exception as e2:
-            logger.warning("Предпросмотр пересылкой тоже не удался: %s", e2)
+        logger.warning("Не удалось показать предпросмотр: %s", e)
     total = len(get_all_users())
+    mode_name = "пересылкой" if mode == "forward" else "копией"
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=f"✅ Разослать всем ({total})", callback_data="bc_send")],
+        [InlineKeyboardButton(text=f"✅ Разослать копией ({total})", callback_data="bc_send")],
+        [InlineKeyboardButton(text="↪️ Разослать пересылкой", callback_data="bc_send_fwd")],
+        [InlineKeyboardButton(text=("👀 Показать копией" if mode == "forward" else "👀 Показать пересылкой"),
+                              callback_data=("bc_preview" if mode == "forward" else "bc_preview_fwd"))],
         [InlineKeyboardButton(text="🔁 Другое сообщение", callback_data="bc_again"),
          InlineKeyboardButton(text="❌ Отмена", callback_data="bc_cancel")]])
-    note = ("👀 <b>Предпросмотр отправлен выше</b> — именно так увидят его получатели."
+    note = (f"👀 <b>Предпросмотр {mode_name} отправлен выше</b> — именно так увидят его получатели."
             if preview_ok else
-            "⚠️ <b>Предпросмотр не удался</b> (Telegram отклонил копию). Рассылка, скорее всего, тоже не пройдёт — "
-            "попробуй другое сообщение.")
+            "⚠️ <b>Предпросмотр не удался</b> — Телеграм отклонил отправку. Попробуй другое сообщение.")
     await bot.send_message(
         chat_id,
         f"{note}\n\n"
         f"📦 Сообщений в посте: <b>{len(msg_ids)}</b>\n"
-        f"👥 Получателей: <b>{total}</b>\n"
-        f"😀 Премиум-эмодзи и медиа сохраняются при копировании.\n\n"
-        "Отправляем?",
+        f"👥 Получателей: <b>{total}</b>\n\n"
+        "😀 <b>Премиум-эмодзи:</b> копия их теряет (боту нельзя использовать кастомные эмодзи), "
+        "а <b>пересылка сохраняет</b> — но добавляет подпись «Переслано от …».\n"
+        "Нажми «👀 Показать…», чтобы сравнить оба варианта и выбрать.\n\n"
+        "Что отправляем?",
         reply_markup=kb, parse_mode="HTML")
+
+
+@dp.callback_query(F.data == "bc_preview_fwd")
+async def cb_bc_preview_fwd(call: types.CallbackQuery, state: FSMContext):
+    if not is_admin(call.from_user.id):
+        return
+    data = await state.get_data()
+    ids = list(data.get("bc_ids") or [])
+    from_chat = data.get("bc_chat") or call.message.chat.id
+    await call.answer("Показываю пересылкой")
+    if not ids:
+        return
+    await show_broadcast_preview(from_chat, ids, state, mode="forward")
+
+
+@dp.callback_query(F.data == "bc_preview")
+async def cb_bc_preview_copy(call: types.CallbackQuery, state: FSMContext):
+    if not is_admin(call.from_user.id):
+        return
+    data = await state.get_data()
+    ids = list(data.get("bc_ids") or [])
+    from_chat = data.get("bc_chat") or call.message.chat.id
+    await call.answer("Показываю копией")
+    if not ids:
+        return
+    await show_broadcast_preview(from_chat, ids, state, mode="copy")
 
 
 @dp.callback_query(F.data == "bc_again")
@@ -3916,7 +3942,8 @@ async def cb_bc_again(call: types.CallbackQuery, state: FSMContext):
     await state.set_state(AdminStates.broadcast)
     await call.message.edit_text(
         "📢 <b>Рассылка</b>\n\nПришли или перешли новое сообщение "
-        "(можно альбом и премиум-эмодзи). ❌ /cancel — отмена", parse_mode="HTML")
+        "(можно альбом). Премиум-эмодзи вставляются только в приложении Telegram — "
+        "перешли готовый пост с ними. ❌ /cancel — отмена", parse_mode="HTML")
 
 
 @dp.callback_query(F.data == "bc_cancel")
@@ -3930,6 +3957,15 @@ async def cb_bc_cancel(call: types.CallbackQuery, state: FSMContext):
 
 @dp.callback_query(F.data == "bc_send")
 async def cb_bc_send(call: types.CallbackQuery, state: FSMContext):
+    await _broadcast_start(call, state, mode="copy")
+
+
+@dp.callback_query(F.data == "bc_send_fwd")
+async def cb_bc_send_fwd(call: types.CallbackQuery, state: FSMContext):
+    await _broadcast_start(call, state, mode="forward")
+
+
+async def _broadcast_start(call: types.CallbackQuery, state: FSMContext, mode="copy"):
     if not is_admin(call.from_user.id):
         return
     data = await state.get_data()
@@ -3938,16 +3974,33 @@ async def cb_bc_send(call: types.CallbackQuery, state: FSMContext):
     if not ids:
         return await call.answer("Сообщение потерялось — пришли его заново", show_alert=True)
     await state.clear()
-    await call.answer("📢 Отправляю...")
+    await call.answer("📢 Отправляю..." if mode == "copy" else "↪️ Отправляю пересылкой...")
     try:
         await call.message.edit_reply_markup(reply_markup=None)
     except Exception:
         pass
-    await run_broadcast(call.message, from_chat, ids)
+    await run_broadcast(call.message, from_chat, ids, mode=mode)
 
 
-async def copy_broadcast_message(chat_id, from_chat, msg_ids):
-    """Копирует сообщение/альбом 1-в-1. Если копия не прошла — пересылка, потом по одному."""
+async def send_broadcast_message(chat_id, from_chat, msg_ids, mode="copy"):
+    """Отправляет пост получателю.
+
+    mode="copy"    — копия без пометки «переслано от». Минус: премиум-эмодзи
+                     Телеграм у бота вырезает (кастомные эмодзи разрешены только
+                     ботам с купленным юзернеймом на Fragment).
+    mode="forward" — пересылка: премиум-эмодзи сохраняются, но появляется
+                     подпись «Переслано от …» (для канала это даже плюс).
+    """
+    if mode == "forward":
+        try:
+            if len(msg_ids) > 1 and hasattr(bot, "forward_messages"):
+                await bot.forward_messages(chat_id, from_chat_id=from_chat, message_ids=msg_ids)
+            else:
+                for mid in msg_ids:
+                    await bot.forward_message(chat_id, from_chat_id=from_chat, message_id=mid)
+            return "forward"
+        except Exception as e:
+            logger.warning("Пересылка для %s не удалась (%s) — пробую копию", chat_id, e)
     if len(msg_ids) > 1 and hasattr(bot, "copy_messages"):
         try:
             await bot.copy_messages(chat_id, from_chat_id=from_chat, message_ids=msg_ids)
@@ -3963,23 +4016,30 @@ async def copy_broadcast_message(chat_id, from_chat, msg_ids):
     return "copy-one-by-one"
 
 
-async def run_broadcast(status_message, from_chat, msg_ids):
+async def copy_broadcast_message(chat_id, from_chat, msg_ids):
+    """Совместимость: копия поста с запасными путями."""
+    return await send_broadcast_message(chat_id, from_chat, msg_ids, mode="copy")
+
+
+async def run_broadcast(status_message, from_chat, msg_ids, mode="copy"):
     users = get_all_users()
     total = len(users)
+    mode_name = "пересылкой" if mode == "forward" else "копией"
     st = await status_message.answer(
-        f"⏳ <b>Рассылка началась</b>\n👥 Получателей: {total}\n📦 Пост из {len(msg_ids)} сообщ.", parse_mode="HTML")
+        f"⏳ <b>Рассылка началась ({mode_name})</b>\n👥 Получателей: {total}\n📦 Пост из {len(msg_ids)} сообщ.",
+        parse_mode="HTML")
     ok = failed = 0
     problems = []
     for i, u in enumerate(users, 1):
         try:
-            await copy_broadcast_message(u[0], from_chat, msg_ids)
+            await send_broadcast_message(u[0], from_chat, msg_ids, mode=mode)
             ok += 1
             await asyncio.sleep(0.05)
         except TelegramRetryAfter as e:
             # Telegram просит подождать — ждём и пробуем ещё раз, иначе потеряем человека
             await asyncio.sleep(getattr(e, "retry_after", 5) + 1)
             try:
-                await copy_broadcast_message(u[0], from_chat, msg_ids)
+                await send_broadcast_message(u[0], from_chat, msg_ids, mode=mode)
                 ok += 1
             except Exception as e2:
                 failed += 1
@@ -3993,7 +4053,7 @@ async def run_broadcast(status_message, from_chat, msg_ids):
                 await st.edit_text(f"⏳ <b>Рассылка…</b>\n\n📨 {ok} | ❌ {failed} | 👥 из {total}", parse_mode="HTML")
             except Exception:
                 pass
-    summary = (f"✅ <b>Рассылка завершена</b>\n\n📨 Доставлено: <b>{ok}</b>\n"
+    summary = (f"✅ <b>Рассылка завершена ({mode_name})</b>\n\n📨 Доставлено: <b>{ok}</b>\n"
                f"❌ Ошибок: <b>{failed}</b>\n👥 Всего: <b>{total}</b>")
     if problems:
         head = "\n\n<b>Первые ошибки:</b>\n" + "\n".join(f"• <code>{uid}</code>: {html.escape(err)}" for uid, err in problems[:5])
@@ -4002,7 +4062,7 @@ async def run_broadcast(status_message, from_chat, msg_ids):
         await st.edit_text(summary, parse_mode="HTML")
     except Exception:
         await status_message.answer(summary, parse_mode="HTML")
-    logger.info("Рассылка: доставлено %s, ошибок %s, всего %s", ok, failed, total)
+    logger.info("Рассылка (%s): доставлено %s, ошибок %s, всего %s", mode, ok, failed, total)
 
 
 @dp.callback_query(F.data == "adm_ban")
