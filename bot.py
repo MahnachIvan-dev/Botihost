@@ -70,7 +70,8 @@ from pathlib import Path
 from typing import Dict
 
 from aiogram import Bot, Dispatcher, types, F, BaseMiddleware
-from aiogram.exceptions import TelegramConflictError, TelegramUnauthorizedError
+from aiogram.exceptions import (TelegramConflictError, TelegramUnauthorizedError, TelegramRetryAfter,
+                                TelegramBadRequest)
 from aiogram.filters import Command
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, FSInputFile
 from aiogram.fsm.context import FSMContext
@@ -120,7 +121,7 @@ elif _cashier_env in ("0", "false", "no", "off", "выкл"):
 else:
     INTERNAL_CASHIER_MODE = "auto"
 INTERNAL_CASHIER = INTERNAL_CASHIER_MODE  # для обратной совместимости и логов
-BOTHOST_VERSION = "9.4"
+BOTHOST_VERSION = "9.6"
 
 DATA_DIR = Path(os.environ.get("DATA_DIR", "/app/data"))
 BOTS_DIR = DATA_DIR / "bots"
@@ -133,17 +134,25 @@ BOTS_DIR.mkdir(parents=True, exist_ok=True)
 # 💎 КАТАЛОГ ТАРИФОВ
 # kind: "bot"  — слот на одного бота
 #       "host" — хостинг: ботов без лимита
+#
+# Цены можно менять БЕЗ правки кода — переменными окружения (см. apply_plan_overrides):
+#   PRICE_HOST_MONTH=199      цена тарифа host_month в Stars
+#   DAYS_HOST_MONTH=45        срок в днях
+#   PRICE_WEEK=20  DAYS_2WEEKS=10
+#   PLANS_JSON={"host_month":{"stars":199,"days":45}}
+# ⚠️ Имена переменных должны совпадать в bot.py и cashier.py, иначе BotHost покажет
+#    одну сумму, а кассир потребует другую.
 # ───────────────────────────────────────────────────────────────
 
-PLANS = {
+BASE_PLANS = {
     # 🧩 Слот на 1 бота
     "week":   {"name": "Неделя",   "stars": 15, "days": 7,  "kind": "bot",  "emoji": "📅"},
     "2weeks": {"name": "2 недели", "stars": 25, "days": 14, "kind": "bot",  "emoji": "🗓"},
     "month":  {"name": "Месяц",    "stars": 50, "days": 30, "kind": "bot",  "emoji": "💎"},
     # 🚀 Хостинг без лимита ботов
-    "host_week":   {"name": "Хостинг · Неделя",   "stars": 50,  "days": 7,  "kind": "host", "emoji": "🚀"},
-    "host_2weeks": {"name": "Хостинг · 2 недели", "stars": 100,  "days": 14, "kind": "host", "emoji": "🛰"},
-    "host_month":  {"name": "Хостинг · Месяц",    "stars": 100, "days": 30, "kind": "host", "emoji": "🌌"},
+    "host_week":   {"name": "Хостинг · Неделя",   "stars": 39,  "days": 7,  "kind": "host", "emoji": "🚀"},
+    "host_2weeks": {"name": "Хостинг · 2 недели", "stars": 65,  "days": 14, "kind": "host", "emoji": "🛰"},
+    "host_month":  {"name": "Хостинг · Месяц",    "stars": 130, "days": 30, "kind": "host", "emoji": "🌌"},
 }
 
 KINDS = {
@@ -162,6 +171,60 @@ KINDS = {
 BOT_START_TIME = time.time()
 logging.basicConfig(level=logging.INFO, format="%(asctime)s │ %(levelname)-7s │ %(message)s", datefmt="%H:%M:%S")
 logger = logging.getLogger("BotHost")
+
+
+def plan_env_suffix(pid):
+    """host_month → HOST_MONTH, 2weeks → 2WEEKS."""
+    return re.sub(r"[^A-Za-z0-9]", "_", pid).upper()
+
+
+def apply_plan_overrides(plans, env=None):
+    """Применяет цены/сроки из переменных окружения к таблице тарифов.
+
+    Такая же функция есть в cashier.py с тем же набором переменных — так цены
+    невозможно рассогласовать между сервисами.
+    """
+    log = logging.getLogger("BotHost")
+    env = os.environ if env is None else env
+
+    def read_int(name, raw, default):
+        raw = str(raw).strip().replace(",", ".")
+        if not raw:
+            return default
+        try:
+            return max(1, int(float(raw)))
+        except ValueError:
+            log.warning("%s=%r — не число, оставляю %s", name, raw, default)
+            return default
+
+    for pid, p in plans.items():
+        sfx = plan_env_suffix(pid)
+        p["stars"] = read_int(f"PRICE_{sfx}", env.get(f"PRICE_{sfx}", ""), p["stars"])
+        p["days"] = read_int(f"DAYS_{sfx}", env.get(f"DAYS_{sfx}", ""), p["days"])
+
+    raw_json = str(env.get("PLANS_JSON", "") or env.get("CASHIER_PLANS_JSON", "")).strip()
+    if raw_json:
+        try:
+            patch = json.loads(raw_json)
+            if not isinstance(patch, dict):
+                raise ValueError("ожидался объект вида {\"host_month\": {\"stars\": 199}}")
+            for pid, fields in patch.items():
+                if pid not in plans or not isinstance(fields, dict):
+                    log.warning("PLANS_JSON: пропускаю %r", pid)
+                    continue
+                for field in ("name", "stars", "days", "kind", "emoji"):
+                    if field in fields:
+                        plans[pid][field] = fields[field]
+                plans[pid]["stars"] = read_int(f"PLANS_JSON[{pid}].stars", plans[pid]["stars"], plans[pid]["stars"])
+                plans[pid]["days"] = read_int(f"PLANS_JSON[{pid}].days", plans[pid]["days"], plans[pid]["days"])
+                if plans[pid]["kind"] not in ("bot", "host"):
+                    plans[pid]["kind"] = "bot"
+        except Exception as e:
+            log.error("PLANS_JSON не разобран (%s) — беру тарифы по умолчанию", e)
+    return plans
+
+
+PLANS = apply_plan_overrides({pid: dict(p) for pid, p in BASE_PLANS.items()})
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
@@ -941,6 +1004,7 @@ def ensure_telegram_package():
         pass
 
 ensure_telegram_package()
+print("[ BotHost ] Зависимости готовы, запускаю проект...", flush=True)
 process=None
 def handle_signal(signum,frame):
     global process
@@ -1059,8 +1123,9 @@ async def restore_bot_files(bot_id: int):
         # перестарался запускаться.
         b = get_bot(bot_id)
         stored = b[7] if b and len(b) > 7 else ""
-        ep = resolve_entry_point(bot_id, bot_dir, stored)
-        logger.info("♻️ Файлы бота #%s восстановлены из Telegram Storage (точка входа: %s)", bot_id, ep or "не найдена")
+        ep, fixed = resolve_entry_point(bot_id, bot_dir, stored)
+        logger.info("♻️ Файлы бота #%s восстановлены из Telegram Storage (точка входа: %s%s)",
+                    bot_id, ep or "не найдена", ", исправлена" if fixed else "")
         return True
     except Exception as e:
         logger.warning("Не удалось восстановить файлы бота #%s: %s", bot_id, e)
@@ -1084,11 +1149,28 @@ async def start_user_bot(bot_id):
                 return True
             bot_dir = BOTS_DIR / f"bot_{bot_id}"
             bot_dir.mkdir(parents=True, exist_ok=True)
-            ep = resolve_entry_point(bot_id, bot_dir, b[7] if len(b) > 7 else "")
+            stored_ep = b[7] if len(b) > 7 else ""
+            ep, ep_fixed = resolve_entry_point(bot_id, bot_dir, stored_ep)
             if not ep:
                 logger.error("У бота #%s нет .py файла для запуска", bot_id)
                 _db_retry(lambda conn: conn.execute("UPDATE bots SET status='error' WHERE id=?", (bot_id,)))
                 return False
+            logger.info("▶️ Запуск бота #%s | точка входа: %s%s | первый запуск может ставить зависимости (несколько минут)",
+                        bot_id, ep, " (исправлена автоматически)" if ep_fixed else "")
+            if ep_fixed:
+                try:
+                    await bot.send_message(
+                        b[1],
+                        f"🔧 <b>Точка входа бота #{bot_id} исправлена автоматически</b>\n\n"
+                        f"Было: <code>{html.escape(stored_ep or '—')}</code>\n"
+                        f"Стало: <code>{html.escape(ep)}</code>\n\n"
+                        f"Файл «{html.escape(stored_ep or '—')}» не похож на файл запуска "
+                        "(в нём нет <code>if __name__ == \"__main__\"</code> и запуска бота), "
+                        "поэтому выбран основной файл проекта.\n"
+                        "Если нужен другой — «🤖 Мои проекты» → бот → «📄 Точка входа».",
+                        parse_mode="HTML")
+                except Exception:
+                    pass
             write_wrapper(bot_dir, ep)
             log_file = bot_dir / "bot.log"
             with open(log_file, "a", encoding="utf-8") as f:
@@ -1794,7 +1876,7 @@ async def back_main(call: types.CallbackQuery, state: FSMContext):
     await state.clear()
     lim = get_limits(call.from_user.id)
     if lim["unlimited"]:
-        head = "🏠 <b>BotHost</b>"
+        head = "🏠 <b>BotHost</b> · 🚀 без лимита ботов"
     elif lim["slots"]:
         head = f"🏠 <b>BotHost</b> · 🧩 слотов: {len(get_user_bots(call.from_user.id))}/{lim['slots']}"
     else:
@@ -1916,18 +1998,36 @@ def find_entry_point(bot_dir: Path) -> str:
     return files[0] if files else ""
 
 
-def resolve_entry_point(bot_id: int, bot_dir: Path, stored: str) -> str:
-    """Не даём старой записи user_bot.py ломать запуск, если такого файла уже нет."""
+def resolve_entry_point(bot_id: int, bot_dir: Path, stored: str):
+    """Возвращает рабочую точку входа и лечит испорченную запись.
+
+    Раньше проверялось только «файл существует». Из-за этого в базе мог остаться
+    библиотечный файл (например apscheduler.py), и бот запускался вхолостую:
+    скрипт мгновенно завершался, а снаружи это выглядело как цикл падений.
+    Теперь, если запись не похожа на файл запуска, а в проекте есть файл, который
+    на него похож, — переключаемся и говорим об этом владельцу.
+
+    Возвращает (точка_входа, было_исправлено).
+    """
     stored = (stored or "").replace("\\", "/").lstrip("/")
     candidate = (bot_dir / stored).resolve() if stored else None
     root = bot_dir.resolve()
     if candidate and str(candidate).startswith(str(root) + os.sep) and candidate.is_file() and candidate.suffix.lower() == ".py":
-        return candidate.relative_to(root).as_posix()
+        rel = candidate.relative_to(root).as_posix()
+        if looks_like_entry_point(bot_dir, rel):
+            return rel, False
+        better = find_entry_point(bot_dir)
+        if better and better != rel and looks_like_entry_point(bot_dir, better):
+            logger.warning("Точка входа бота #%s выглядела как библиотечный файл (%s) — переключаю на %s",
+                           bot_id, rel, better)
+            update_bot_entry(bot_id, better)
+            return better, True
+        return rel, False
     detected = find_entry_point(bot_dir)
     if detected:
         update_bot_entry(bot_id, detected)
-        return detected
-    return ""
+        return detected, bool(stored and stored != detected)
+    return "", False
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -3729,34 +3829,180 @@ async def cb_adm_broadcast(call: types.CallbackQuery, state: FSMContext):
         return
     await state.set_state(AdminStates.broadcast)
     await call.message.edit_text(
-        "📢 <b>Мультимедийная рассылка</b>\n\n"
-        "Отправь <b>одно сообщение</b> любого типа — BotHost скопирует его пользователям без подписи от имени владельца.\n\n"
-        "Поддерживается: текст, 🖼 фото, 🎥 видео, 🎵 аудио, 🎙 голос, 📄 документы, GIF/анимации и стикеры.\n"
-        "Сохраняются HTML/Markdown-подобное форматирование Telegram, эмодзи, подпись к медиа и entities.\n\n"
+        "📢 <b>Рассылка</b>\n\n"
+        "Отправь или <b>перешли</b> сюда готовое сообщение — бот скопирует его "
+        "пользователям <b>один-в-один</b>: медиа, подпись, форматирование и "
+        "премиум-эмодзи сохраняются.\n\n"
+        "• 🖼 фото, 🎥 видео, 🎵 аудио, 🎙 голос, 📄 документы, GIF, стикеры\n"
+        "• 📚 альбом (несколько фото/видео одним постом) — можно\n"
+        "• 😀 премиум-эмодзи и кастомные эмодзи — можно\n"
+        "• 🔗 сообщение без ссылки «переслано от» (не пересылка, а копия)\n\n"
+        "Сначала бот покажет <b>предпросмотр тебе</b> — как это увидят люди. "
+        "Потом подтвердишь отправку.\n\n"
         "❌ /cancel — отмена",
         parse_mode="HTML")
 
 
+_album_buffer: Dict[str, list] = {}
+_album_tasks: Dict[str, asyncio.Task] = {}
+
+
 @dp.message(AdminStates.broadcast)
-async def adm_broadcast_send(message: types.Message, state: FSMContext):
+async def adm_broadcast_input(message: types.Message, state: FSMContext):
     if not is_admin(message.from_user.id):
         return
-    await state.clear()
-    users = get_all_users()
-    st = await message.answer(f"⏳ <b>Начинаю рассылку</b>\nПолучателей: {len(users)}", parse_mode="HTML")
-    ok = 0
-    failed = 0
-    for u in users:
+    # Альбом приходит несколькими сообщениями с общим media_group_id: собираем их
+    # и отправляем как один пост, иначе разошлась бы только первая картинка.
+    if message.media_group_id:
+        gid = str(message.media_group_id)
+        _album_buffer.setdefault(gid, []).append(message.message_id)
+        if gid not in _album_tasks:
+            _album_tasks[gid] = asyncio.create_task(_flush_album(gid, message.chat.id, state))
+        return
+    await show_broadcast_preview(message.chat.id, [message.message_id], state)
+
+
+async def _flush_album(gid, chat_id, state, delay=1.5):
+    try:
+        await asyncio.sleep(delay)
+        ids = sorted(_album_buffer.pop(gid, []))
+        _album_tasks.pop(gid, None)
+        if ids:
+            await show_broadcast_preview(chat_id, ids, state)
+    except Exception:
+        logger.exception("album collect error")
+
+
+async def show_broadcast_preview(chat_id, msg_ids, state):
+    """Показывает владельцу копию будущей рассылки и ждёт подтверждения."""
+    await state.set_state(AdminStates.broadcast)
+    await state.update_data(bc_chat=chat_id, bc_ids=list(msg_ids))
+    preview_ok = True
+    try:
+        if len(msg_ids) > 1 and hasattr(bot, "copy_messages"):
+            await bot.copy_messages(chat_id, from_chat_id=chat_id, message_ids=msg_ids)
+        else:
+            await bot.copy_message(chat_id, from_chat_id=chat_id, message_id=msg_ids[0])
+    except Exception as e:
+        preview_ok = False
+        logger.warning("Не удалось показать предпросмотр копией: %s", e)
         try:
-            await message.copy_to(chat_id=u[0])
+            await bot.forward_messages(chat_id, from_chat_id=chat_id, message_ids=msg_ids)
+        except Exception as e2:
+            logger.warning("Предпросмотр пересылкой тоже не удался: %s", e2)
+    total = len(get_all_users())
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=f"✅ Разослать всем ({total})", callback_data="bc_send")],
+        [InlineKeyboardButton(text="🔁 Другое сообщение", callback_data="bc_again"),
+         InlineKeyboardButton(text="❌ Отмена", callback_data="bc_cancel")]])
+    note = ("👀 <b>Предпросмотр отправлен выше</b> — именно так увидят его получатели."
+            if preview_ok else
+            "⚠️ <b>Предпросмотр не удался</b> (Telegram отклонил копию). Рассылка, скорее всего, тоже не пройдёт — "
+            "попробуй другое сообщение.")
+    await bot.send_message(
+        chat_id,
+        f"{note}\n\n"
+        f"📦 Сообщений в посте: <b>{len(msg_ids)}</b>\n"
+        f"👥 Получателей: <b>{total}</b>\n"
+        f"😀 Премиум-эмодзи и медиа сохраняются при копировании.\n\n"
+        "Отправляем?",
+        reply_markup=kb, parse_mode="HTML")
+
+
+@dp.callback_query(F.data == "bc_again")
+async def cb_bc_again(call: types.CallbackQuery, state: FSMContext):
+    if not is_admin(call.from_user.id):
+        return
+    await state.set_state(AdminStates.broadcast)
+    await call.message.edit_text(
+        "📢 <b>Рассылка</b>\n\nПришли или перешли новое сообщение "
+        "(можно альбом и премиум-эмодзи). ❌ /cancel — отмена", parse_mode="HTML")
+
+
+@dp.callback_query(F.data == "bc_cancel")
+async def cb_bc_cancel(call: types.CallbackQuery, state: FSMContext):
+    if not is_admin(call.from_user.id):
+        return
+    await state.clear()
+    await call.answer("Отменено")
+    await call.message.edit_text("❌ Рассылка отменена. Ничего не отправлено.")
+
+
+@dp.callback_query(F.data == "bc_send")
+async def cb_bc_send(call: types.CallbackQuery, state: FSMContext):
+    if not is_admin(call.from_user.id):
+        return
+    data = await state.get_data()
+    ids = list(data.get("bc_ids") or [])
+    from_chat = data.get("bc_chat") or call.message.chat.id
+    if not ids:
+        return await call.answer("Сообщение потерялось — пришли его заново", show_alert=True)
+    await state.clear()
+    await call.answer("📢 Отправляю...")
+    try:
+        await call.message.edit_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+    await run_broadcast(call.message, from_chat, ids)
+
+
+async def copy_broadcast_message(chat_id, from_chat, msg_ids):
+    """Копирует сообщение/альбом 1-в-1. Если копия не прошла — пересылка, потом по одному."""
+    if len(msg_ids) > 1 and hasattr(bot, "copy_messages"):
+        try:
+            await bot.copy_messages(chat_id, from_chat_id=from_chat, message_ids=msg_ids)
+            return "copy"
+        except TelegramBadRequest as e:
+            logger.warning("copy_messages для %s: %s — отправляю по одному", chat_id, e)
+    for mid in msg_ids:
+        try:
+            await bot.copy_message(chat_id, from_chat_id=from_chat, message_id=mid)
+        except Exception as e:
+            logger.warning("copy_message для %s: %s — пробую переслать", chat_id, e)
+            await bot.forward_message(chat_id, from_chat_id=from_chat, message_id=mid)
+    return "copy-one-by-one"
+
+
+async def run_broadcast(status_message, from_chat, msg_ids):
+    users = get_all_users()
+    total = len(users)
+    st = await status_message.answer(
+        f"⏳ <b>Рассылка началась</b>\n👥 Получателей: {total}\n📦 Пост из {len(msg_ids)} сообщ.", parse_mode="HTML")
+    ok = failed = 0
+    problems = []
+    for i, u in enumerate(users, 1):
+        try:
+            await copy_broadcast_message(u[0], from_chat, msg_ids)
             ok += 1
-            await asyncio.sleep(0.06)
+            await asyncio.sleep(0.05)
+        except TelegramRetryAfter as e:
+            # Telegram просит подождать — ждём и пробуем ещё раз, иначе потеряем человека
+            await asyncio.sleep(getattr(e, "retry_after", 5) + 1)
+            try:
+                await copy_broadcast_message(u[0], from_chat, msg_ids)
+                ok += 1
+            except Exception as e2:
+                failed += 1
+                problems.append((u[0], str(e2)[:80]))
         except Exception as e:
             failed += 1
+            problems.append((u[0], str(e)[:80]))
             logger.warning("broadcast to %s failed: %s", u[0], e)
-    await st.edit_text(
-        f"✅ <b>Рассылка завершена</b>\n\n📨 Доставлено: <b>{ok}</b>\n❌ Ошибок: <b>{failed}</b>\n👥 Всего: <b>{len(users)}</b>",
-        parse_mode="HTML")
+        if i % 25 == 0 and i < total:
+            try:
+                await st.edit_text(f"⏳ <b>Рассылка…</b>\n\n📨 {ok} | ❌ {failed} | 👥 из {total}", parse_mode="HTML")
+            except Exception:
+                pass
+    summary = (f"✅ <b>Рассылка завершена</b>\n\n📨 Доставлено: <b>{ok}</b>\n"
+               f"❌ Ошибок: <b>{failed}</b>\n👥 Всего: <b>{total}</b>")
+    if problems:
+        head = "\n\n<b>Первые ошибки:</b>\n" + "\n".join(f"• <code>{uid}</code>: {html.escape(err)}" for uid, err in problems[:5])
+        summary += head
+    try:
+        await st.edit_text(summary, parse_mode="HTML")
+    except Exception:
+        await status_message.answer(summary, parse_mode="HTML")
+    logger.info("Рассылка: доставлено %s, ошибок %s, всего %s", ok, failed, total)
 
 
 @dp.callback_query(F.data == "adm_ban")
