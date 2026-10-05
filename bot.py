@@ -38,6 +38,10 @@
 
 ⚠️ Обязательно подключи Railway Volume на DATA_DIR (/app/data), иначе при
    редеплое вместе с файлами пропадут и подписки. В логе при старте есть подсказка.
+
+🔗 Кассир: должен работать РОВНО в одном месте. Если он поднят отдельным сервисом —
+   не задавай CASHIER_TOKEN в этом сервисе (внутренний кассир и так выключен).
+   Нужен внутренний кассир — поставь INTERNAL_CASHIER=1 и убери токен из второго.
 """
 
 import os
@@ -58,6 +62,7 @@ import hmac
 import hashlib
 import json
 import importlib
+import importlib.util
 import uuid
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -96,6 +101,11 @@ FILE_STORAGE_CHANNEL_ID = int(os.environ.get("BOT_FILES_STORAGE_CHANNEL_ID", os.
 GRACE_HOURS = int(os.environ.get("GRACE_HOURS", "24"))          # льготный период после истечения
 NOTIFY_BEFORE_DAYS = float(os.environ.get("NOTIFY_BEFORE_DAYS", "3"))  # за сколько дней предупреждать
 SUB_CHECK_INTERVAL = int(os.environ.get("SUB_CHECK_INTERVAL", "600"))  # как часто проверять подписки (сек)
+
+# 💳 Внутренний кассир. По умолчанию ВЫКЛЮЧЕН: кассир должен работать ровно в одном
+# месте. Если он поднят отдельным сервисом, второй polling тем же токеном даёт вечный
+# TelegramConflictError. Включай (INTERNAL_CASHIER=1) только если кассира нет отдельно.
+INTERNAL_CASHIER = os.environ.get("INTERNAL_CASHIER", "0").strip().lower() in {"1", "true", "yes", "on"}
 
 DATA_DIR = Path(os.environ.get("DATA_DIR", "/app/data"))
 BOTS_DIR = DATA_DIR / "bots"
@@ -260,6 +270,34 @@ def get_db():
     return _db_connect()
 
 
+def swap_database_file(tmp_db: Path):
+    """Безопасно подменяет файл базы загруженным бэкапом.
+
+    1. проверяет, что файл — настоящая SQLite-база;
+    2. сохраняет страховочную копию текущей базы;
+    3. удаляет -wal/-shm старой базы (иначе SQLite может прочитать старый журнал
+       и «не увидеть» новый файл);
+    4. подменяет файл и прогоняет init_db() (миграции).
+
+    Возвращает имя страховочной копии или "".
+    """
+    chk = sqlite3.connect(tmp_db)
+    try:
+        chk.execute("SELECT count(*) FROM sqlite_master").fetchone()
+    finally:
+        chk.close()
+    safety_name = ""
+    if DB_PATH.exists():
+        safety_path = DATA_DIR / f"backup_before_restore_{datetime.now().strftime('%Y%m%d_%H%M%S')}.db"
+        shutil.copy2(DB_PATH, safety_path)
+        safety_name = safety_path.name
+    for sfx in ("-wal", "-shm"):
+        Path(str(DB_PATH) + sfx).unlink(missing_ok=True)
+    shutil.move(str(tmp_db), str(DB_PATH))
+    init_db()
+    return safety_name
+
+
 # ─────────────── ПОЛЬЗОВАТЕЛИ ───────────────
 
 def create_user(uid, uname, fname=""):
@@ -268,6 +306,27 @@ def create_user(uid, uname, fname=""):
            VALUES (?, ?, ?, ?)
            ON CONFLICT(user_id) DO UPDATE SET username=excluded.username, full_name=excluded.full_name""",
         (uid, uname, fname, datetime.now().isoformat())))
+
+
+def create_user_soft(uid, uname=""):
+    """Создаёт пользователя, НЕ затирая нормальный @username заглушкой.
+
+    Кассир присылает username в подписанном запросе, но если у человека его нет,
+    приходит "-". Раньше это значение перезаписывало настоящий username в базе,
+    и в админском списке пользователей появлялось «@-».
+    """
+    now = datetime.now().isoformat()
+    uname = (uname or "").strip().lstrip("@")
+    valid = bool(re.fullmatch(r"[A-Za-z0-9_]{4,32}", uname))
+
+    def op(conn):
+        row = conn.execute("SELECT username FROM users WHERE user_id = ?", (uid,)).fetchone()
+        if row is None:
+            conn.execute("INSERT INTO users (user_id, username, full_name, created_at) VALUES (?, ?, '', ?)",
+                         (uid, uname if valid else "", now))
+        elif valid and not (row[0] or "").strip().lstrip("@"):
+            conn.execute("UPDATE users SET username = ? WHERE user_id = ?", (uname, uid))
+    _db_retry(op)
 
 
 def get_user(uid):
@@ -658,6 +717,25 @@ def reject_payment(rid):
 def user_has_pending_request(uid):
     row = _db_read(lambda conn: conn.execute("SELECT COUNT(*) FROM payment_requests WHERE user_id = ? AND status = 'pending'", (uid,)).fetchone())
     return bool(row and row[0] > 0)
+
+
+def close_pending_requests(uid, plan=None, status="approved"):
+    """Закрывает заявки пользователя, чтобы владелец не одобрил оплату ВТОРОЙ раз.
+
+    Нужно, когда кассир подтвердил платёж автоматически: раньше заявка оставалась
+    в статусе pending, владелец жал «Одобрить», и подписка продлевалась дважды за
+    одну оплату.
+    """
+    now = datetime.now().isoformat()
+    def op(conn):
+        if plan:
+            cur = conn.execute("UPDATE payment_requests SET status=?, processed_at=? WHERE user_id=? AND plan=? AND status='pending'",
+                               (status, now, uid, plan))
+        else:
+            cur = conn.execute("UPDATE payment_requests SET status=?, processed_at=? WHERE user_id=? AND status='pending'",
+                               (status, now, uid))
+        return cur.rowcount
+    return _db_retry(op)
 
 
 def create_promo(code, plan, uses):
@@ -1197,17 +1275,100 @@ async def bootstrap_bot_archives():
 
 
 async def restore_running_bots():
+    """Поднимает всё, что в БД помечено как running. Возвращает (запущено, пропущено)."""
     conn = get_db()
     c = conn.cursor()
     c.execute("SELECT id, user_id, is_frozen FROM bots WHERE status = 'running'")
     bots = c.fetchall()
     conn.close()
+    started = skipped = 0
     for bid, uid, frozen in bots:
         bot_dir = BOTS_DIR / f"bot_{bid}"
         if not get_python_files(bot_dir):
             await restore_bot_files(bid)
         if not frozen and not is_user_banned(uid) and has_active_slot(uid):
-            await start_user_bot(bid)
+            if await start_user_bot(bid):
+                started += 1
+            else:
+                skipped += 1
+        else:
+            skipped += 1
+    return started, skipped
+
+
+def note_persistence(db_existed_before: bool):
+    """Подсказывает, сохраняются ли данные между деплоями (Railway Volume)."""
+    probe = DATA_DIR / ".data_persists"
+    had_probe = False
+    try:
+        had_probe = probe.exists()
+        probe.write_text(datetime.now().isoformat(), encoding="utf-8")
+    except Exception as e:
+        logger.warning("Не удалось проверить постоянство хранилища: %s", e)
+    if had_probe:
+        logger.info("💾 Хранилище постоянное: подписки, боты и карты переживут редеплой.")
+    elif db_existed_before:
+        logger.warning("⚠️ База есть, а метки прошлого запуска нет — возможно, %s пересоздаётся. "
+                       "Проверь Railway → Volume с mount path %s.", DATA_DIR, DATA_DIR)
+    else:
+        logger.info("💾 Первый запуск: база создаётся в %s.", DATA_DIR)
+
+
+def note_startup_time():
+    """Пишет время старта в БД. Если кто-то стартовал только что — это вторая реплика,
+    и именно она даёт TelegramConflictError."""
+    now = datetime.now()
+    def op(conn):
+        row = conn.execute("SELECT v FROM meta WHERE k='last_start'").fetchone()
+        prev = row[0] if row else None
+        conn.execute("INSERT OR REPLACE INTO meta(k,v) VALUES('last_start',?)", (now.isoformat(),))
+        return prev
+    try:
+        prev = _db_retry(op)
+    except Exception:
+        return
+    if not prev:
+        return
+    try:
+        delta = (now - datetime.fromisoformat(prev)).total_seconds()
+    except Exception:
+        return
+    if 0 <= delta < 180:
+        logger.warning("⚠️ Предыдущий старт был %.0f сек назад (%s). Это похоже на вторую реплику "
+                       "или пересечение деплоя — отсюда TelegramConflictError. Поставь Replicas = 1 "
+                       "и убедись, что старый контейнер остановлен.", delta, prev)
+
+
+async def cashier_token_is_free(token):
+    """Проверяет, не опрашивает ли этот токен кто-то ещё прямо сейчас.
+
+    Telegram отвечает 409 Conflict, если параллельно уже работает другой getUpdates.
+    Так мы ловим забытый второй сервис кассира ДО того, как начнём конфликтовать.
+    Возвращает (свободен, пояснение).
+    """
+    try:
+        async with Bot(token=token) as probe:
+            await probe.get_updates(offset=-1, timeout=0, limit=1)
+        return True, "свободен"
+    except TelegramConflictError:
+        return False, "токен уже опрашивает другой процесс"
+    except TelegramUnauthorizedError:
+        return False, "токен недействителен (проверь CASHIER_TOKEN у @BotFather)"
+    except Exception as e:
+        return True, f"проверить не удалось ({e})"
+
+
+async def apply_restored_state():
+    """После восстановления БД из бэкапа приводит процессы в соответствие с базой:
+    гасит ботов, которых в новой БД нет, и поднимает тех, кто был running."""
+    known = {b[0] for b in get_all_bots()}
+    stopped = 0
+    for bid in list(running_bots.keys()):
+        if bid not in known:
+            await stop_user_bot(bid)
+            stopped += 1
+    started, skipped = await restore_running_bots()
+    return {"started": started, "skipped": skipped, "stopped": stopped}
 
 
 async def auto_backup():
@@ -1386,7 +1547,7 @@ async def channel_payment_request(message: types.Message):
         expected = hmac.new(SYNC_SECRET.encode(), f"request:{uid}:{plan}:{username}".encode(), hashlib.sha256).hexdigest()
         if not hmac.compare_digest(sig, expected) or plan not in PLANS:
             return
-        create_user(uid, username, "")
+        create_user_soft(uid, username)
         if not user_has_pending_request(uid):
             create_payment_request(uid, username, "", plan)
         logger.info("Payment request from cashier: user=%s plan=%s", uid, plan)
@@ -1411,14 +1572,54 @@ async def channel_payment_result(message: types.Message):
         if result == "APPROVED":
             res = add_subscription(uid, plan, grant_id=grant_id)
             if res:
+                # Заявку в админке закрываем: оплата уже начислена автоматически.
+                closed = close_pending_requests(uid, plan, "approved")
+                if closed:
+                    logger.info("Заявок закрыто автоматически после оплаты через кассира: %s (user=%s)", closed, uid)
                 await send_sub_activated(uid, plan, res)
         elif result == "REJECTED":
+            close_pending_requests(uid, plan, "rejected")
             try:
                 await bot.send_message(uid, "❌ <b>Оплата не подтверждена.</b>\nОтправь два чётких скриншота повторно через кассира.", parse_mode="HTML")
             except Exception:
                 pass
     except Exception:
         logger.exception("payment_result error")
+
+
+@dp.channel_post(F.text.startswith("/service_payment_result"))
+async def channel_service_payment_result(message: types.Message):
+    """Оплата доп. услуг кассира (видео/анимации).
+
+    В BotHost таких услуг нет — раньше сообщение просто пропадало в тишине.
+    Теперь фиксируем в логе и уведомляем владельца, чтобы оплаченная услуга
+    не потерялась. Включай услуги в кассире (CASHIER_SERVICES=1) только если
+    выдаёшь их вручную.
+    """
+    try:
+        parts = message.text.strip().split()
+        if len(parts) < 6:
+            return
+        uid = int(parts[1])
+        service_key = parts[2]
+        result = parts[3].upper()
+        grant_id = parts[4]
+        logger.warning("💰 Оплачена услуга кассира: service=%s user=%s result=%s grant=%s — "
+                       "в BotHost услуг нет, выдай вручную.", service_key, uid, result, grant_id)
+        if result == "APPROVED":
+            for target in {OWNER_ID, uid}:
+                try:
+                    await bot.send_message(
+                        target,
+                        f"💰 <b>Оплата услуги «{html.escape(service_key)}»</b>\n\n"
+                        f"👤 ID: <code>{uid}</code>\n✅ Статус: {result}\n🔖 Grant: <code>{html.escape(grant_id)}</code>"
+                        + ("\n\n⚠️ В BotHost эта услуга не выдаётся автоматически — свяжись с владельцем."
+                           if target == uid else "\n\n⚠️ Выдай услугу вручную."),
+                        parse_mode="HTML")
+                except Exception:
+                    pass
+    except Exception:
+        logger.exception("service_payment_result error")
 
 
 @dp.channel_post(F.text.startswith("/auto_grant"))
@@ -1441,6 +1642,7 @@ async def channel_auto_grant(message: types.Message):
         if not res:
             logger.info("Повторный auto_grant %s проигнорирован", grant_id)
             return
+        close_pending_requests(uid, plan, "approved")
         await send_sub_activated(uid, plan, res)
         try:
             await message.reply(
@@ -1661,21 +1863,39 @@ async def handle_files(message: types.Message, state: FSMContext):
 
     # Восстановление БД владельцем
     if uid == OWNER_ID and ext == "db" and curr is None:
+        tmp_db = DATA_DIR / f"restore_{uuid.uuid4().hex}.db"
         try:
+            await message.answer("⏳ <i>Загружаю базу и привожу ботов в порядок...</i>", parse_mode="HTML")
             finfo = await bot.get_file(doc.file_id)
-            await bot.download_file(finfo.file_path, destination=DB_PATH)
-            init_db()
+            await bot.download_file(finfo.file_path, destination=tmp_db)
+            safety_name = swap_database_file(tmp_db)
+
             restored = 0
             for b in get_all_bots():
                 if await restore_bot_files(b[0]):
                     restored += 1
+            # Раньше после подмены базы боты оставались лежать: процессы в памяти
+            # не соответствовали новой БД. Теперь синхронизируем состояние.
+            act = await apply_restored_state()
+            stats = get_stats()
             return await message.answer(
                 f"✅ <b>Память восстановлена!</b>\n\n🤖 Записей ботов: <b>{len(get_all_bots())}</b>\n"
                 f"📦 Файловых архивов восстановлено: <b>{restored}</b>\n"
-                f"📊 Активных подписок: <b>{get_stats()['slots'] + get_stats()['hosts']}</b>",
+                f"📊 Подписок активно: <b>{stats['slots'] + stats['hosts']}</b> + 🎫 <b>{stats['vips']}</b>\n"
+                f"🚀 Ботов запущено: <b>{act['started']}</b>"
+                + (f" · пропущено: <b>{act['skipped']}</b>" if act["skipped"] else "")
+                + (f"\n⏹ Остановлено лишних: <b>{act['stopped']}</b>" if act["stopped"] else "")
+                + (f"\n\n🛟 Старая база сохранена как <code>{safety_name}</code> — "
+                   "если залил не тот бэкап, пришли этот файл обратно."
+                   if safety_name else ""),
                 parse_mode="HTML")
         except Exception as e:
-            return await message.answer(f"❌ Ошибка: {e}")
+            return await message.answer(f"❌ Ошибка восстановления базы: {e}\n\nТекущая база не тронута.")
+        finally:
+            try:
+                tmp_db.unlink(missing_ok=True)
+            except Exception:
+                pass
 
     # Новый бот
     allowed, reason = can_add_bot(uid)
@@ -3520,12 +3740,15 @@ async def cb_restart_all(call: types.CallbackQuery):
 # ═══════════════════════════════════════════════════════════════
 
 async def main():
+    db_existed_before = DB_PATH.exists()
     init_db()
     if not BOT_TOKEN:
         raise RuntimeError("BOT_TOKEN не задан. Добавьте его в Variables/Environment.")
     if not SYNC_SECRET:
         logger.warning("SYNC_SECRET не задан — автоматическая выдача через кассира отключена.")
     acquire_instance_lock()
+    note_persistence(db_existed_before)
+    note_startup_time()
     logger.info("=" * 50)
     logger.info("🤖 BotHost v9.0 | pid=%s | db=%s", os.getpid(), DB_PATH)
     logger.info(f"👤 Владелец: {OWNER_ID}")
@@ -3550,26 +3773,48 @@ async def main():
     asyncio.create_task(auto_backup())
     asyncio.create_task(monitor_subscriptions())
 
-    # Внутренний кассир работает в ЭТОМ ЖЕ Railway-сервисе, но использует
-    # отдельный Telegram token и отдельный Dispatcher.
+    # Кассир должен работать РОВНО в одном месте. Внутренний запуск по умолчанию
+    # выключен: если кассир поднят отдельным сервисом, второй polling тем же токеном
+    # даёт вечный TelegramConflictError.
     cashier_task = None
-    if os.environ.get("CASHIER_TOKEN", "").strip():
-        async def run_internal_cashier():
-            while True:
-                try:
-                    cashier = importlib.import_module("cashier")
-                    logger.info("💳 Внутренний кассир запускается в том же Railway-сервисе...")
-                    await cashier.main()
-                    logger.warning("⚠️ Кассир завершил polling без исключения; перезапуск через 3 сек")
-                except asyncio.CancelledError:
-                    raise
-                except Exception:
-                    logger.exception("❌ Внутренний кассир остановился; перезапуск через 5 сек")
-                await asyncio.sleep(5)
+    cashier_token_present = bool(os.environ.get("CASHIER_TOKEN", "").strip())
+    if INTERNAL_CASHIER and cashier_token_present:
+        if importlib.util.find_spec("cashier") is None:
+            logger.error("❌ INTERNAL_CASHIER=1, но модуль cashier.py не найден рядом с bot.py — "
+                         "внутренний кассир не запущен.")
+        else:
+            free, why = await cashier_token_is_free(os.environ.get("CASHIER_TOKEN", "").strip())
+            if not free:
+                logger.error("❌ Внутренний кассир НЕ запущен: %s.\n"
+                             "   Значит, кассир уже где-то работает (второй сервис, старая реплика или "
+                             "локальный запуск). Оставь его ТОЛЬКО в одном месте:\n"
+                             "   • либо здесь (INTERNAL_CASHIER=1) — тогда удали сервис/переменную кассира во втором месте;\n"
+                             "   • либо отдельным сервисом — тогда убери INTERNAL_CASHIER и CASHIER_TOKEN отсюда.\n"
+                             "   Пока работает второй экземпляр — оплата идёт через него, конфликтов не будет.", why)
+            else:
+                async def run_internal_cashier():
+                    while True:
+                        try:
+                            cashier = importlib.import_module("cashier")
+                            logger.info("💳 Внутренний кассир запускается в том же сервисе...")
+                            await cashier.main()
+                            logger.warning("⚠️ Кассир завершил polling без исключения; перезапуск через 3 сек")
+                        except asyncio.CancelledError:
+                            raise
+                        except Exception:
+                            logger.exception("❌ Внутренний кассир остановился; перезапуск через 5 сек")
+                        await asyncio.sleep(5)
 
-        cashier_task = asyncio.create_task(run_internal_cashier(), name="internal-cashier")
+                cashier_task = asyncio.create_task(run_internal_cashier(), name="internal-cashier")
+                logger.info("✅ Токен кассира свободен (%s) — внутренний кассир стартует", why)
+    elif INTERNAL_CASHIER and not cashier_token_present:
+        logger.warning("⚠️ INTERNAL_CASHIER=1, но CASHIER_TOKEN не задан — внутренний кассир не запущен")
+    elif cashier_token_present:
+        logger.warning("⚠️ CASHIER_TOKEN задан, но внутренний кассир ВЫКЛЮЧЕН (INTERNAL_CASHIER != 1). "
+                       "Это правильно, если кассир работает отдельным сервисом: один токен — один polling. "
+                       "Нужен кассир внутри этого сервиса — поставь INTERNAL_CASHIER=1 и убери его из второго сервиса.")
     else:
-        logger.warning("⚠️ CASHIER_TOKEN не задан — внутренний кассир отключён")
+        logger.info("ℹ️ Внутренний кассир выключен — оплата идёт через отдельный сервис кассира.")
 
     try:
         while True:
@@ -3580,7 +3825,15 @@ async def main():
             except asyncio.CancelledError:
                 raise
             except TelegramConflictError:
-                logger.exception("❌ TelegramConflictError: BOT_TOKEN уже используется другим polling-процессом")
+                logger.error(
+                    "❌ TelegramConflictError: этот BOT_TOKEN прямо сейчас опрашивает другой процесс.\n"
+                    "   Что проверить:\n"
+                    "   1) Railway → Settings: реплик должно быть 1 (Replicas = 1);\n"
+                    "   2) старый деплой/контейнер ещё жив — во время редеплоя ~30 сек "
+                    "пересечения это нормально, ошибка сама проходит;\n"
+                    "   3) нет ли второго сервиса (или локального запуска) с тем же BOT_TOKEN;\n"
+                    "   4) CASHIER_TOKEN должен быть задан ТОЛЬКО в одном месте — либо здесь "
+                    "(внутренний кассир), либо в отдельном сервисе, но не в обоих.")
                 raise
             except TelegramUnauthorizedError:
                 logger.exception("❌ TelegramUnauthorizedError: BOT_TOKEN недействителен")
