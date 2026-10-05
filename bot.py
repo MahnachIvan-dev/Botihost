@@ -120,7 +120,7 @@ elif _cashier_env in ("0", "false", "no", "off", "выкл"):
 else:
     INTERNAL_CASHIER_MODE = "auto"
 INTERNAL_CASHIER = INTERNAL_CASHIER_MODE  # для обратной совместимости и логов
-BOTHOST_VERSION = "9.3"
+BOTHOST_VERSION = "9.4"
 
 DATA_DIR = Path(os.environ.get("DATA_DIR", "/app/data"))
 BOTS_DIR = DATA_DIR / "bots"
@@ -1248,7 +1248,7 @@ async def monitor_subscriptions():
             now = datetime.now()
             for s in rows:
                 sub_id, uid, kind, pid, expires_at, _period, r3, r1, expn, _created = s
-                if is_user_banned(uid):
+                if not should_notify_about_sub(uid):
                     continue
                 p = PLANS.get(pid, {})
                 exp = datetime.fromisoformat(expires_at)
@@ -1519,6 +1519,18 @@ def get_uptime():
     h, r = divmod(r, 3600)
     m, _ = divmod(r, 60)
     return f"{d}д {h}ч {m}м"
+
+
+def should_notify_about_sub(uid):
+    """Нужно ли беспокоить человека напоминанием об оплате.
+
+    Админов/владельца и держателей безлимит-карты — нет: их подписки ни на что
+    не влияют (доступ и так безлимитный), а записи могли остаться от миграции
+    старых слотов из v8. Именно из-за этого владелец получал «продлите подписку».
+    """
+    if is_admin(uid) or is_vip(uid):
+        return False
+    return not is_user_banned(uid)
 
 
 def plans_of_kind(kind):
@@ -3264,12 +3276,19 @@ async def cb_adm_subs(call: types.CallbackQuery):
                 [InlineKeyboardButton(text="🎁 Выдать подписку", callback_data="adm_grant")],
                 [InlineKeyboardButton(text="« Админка", callback_data="admin")]]))
     text = f"📦 <b>Активные подписки ({len(rows)})</b>\n\n"
+    unlimited_hint = False
     kb = []
     for s in rows[:30]:
         p = PLANS.get(s[3], {})
         emoji = KINDS.get(s[2], {}).get("emoji", "•")
-        text += f"{emoji} <code>{s[1]}</code> · {p.get('name', s[3])} · {human_left(s[4])}\n"
+        note = ""
+        if is_admin(s[1]) or is_vip(s[1]):
+            note = " · ♾ не влияет (безлимит)"
+            unlimited_hint = True
+        text += f"{emoji} <code>{s[1]}</code> · {p.get('name', s[3])} · {human_left(s[4])}{note}\n"
         kb.append([InlineKeyboardButton(text=f"{emoji} {s[1]} · {human_left(s[4])}", callback_data=f"adm_sub:{s[0]}")])
+    if unlimited_hint:
+        text += "\n♾ У админов и безлимит-карт подписки ни на что не влияют — напоминания им не приходят."
     kb.append([InlineKeyboardButton(text="🎁 Выдать подписку", callback_data="adm_grant")])
     kb.append([InlineKeyboardButton(text="« Админка", callback_data="admin")])
     await call.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=kb), parse_mode="HTML")
