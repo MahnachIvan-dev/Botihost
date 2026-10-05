@@ -1,5 +1,5 @@
 """
-🤖 BotHost v9.0 — Subscriptions Edition
+🤖 BotHost v9.3 — Subscriptions Edition
 ────────────────────────────────────────────────────────────────
 Что изменилось по сравнению с v8.0:
 
@@ -39,9 +39,10 @@
 ⚠️ Обязательно подключи Railway Volume на DATA_DIR (/app/data), иначе при
    редеплое вместе с файлами пропадут и подписки. В логе при старте есть подсказка.
 
-🔗 Кассир: должен работать РОВНО в одном месте. Если он поднят отдельным сервисом —
-   не задавай CASHIER_TOKEN в этом сервисе (внутренний кассир и так выключен).
-   Нужен внутренний кассир — поставь INTERNAL_CASHIER=1 и убери токен из второго.
+🔗 Кассир: по умолчанию режим «auto» — если задан CASHIER_TOKEN, кассир поднимается
+   внутри этого же сервиса (как в v8). Перед запуском проверяется занятость токена,
+   поэтому забытый второй экземпляр больше не даёт конфликтов.
+   Кассир отдельным сервисом → поставь INTERNAL_CASHIER=0 (и убери CASHIER_TOKEN отсюда).
 """
 
 import os
@@ -102,10 +103,24 @@ GRACE_HOURS = int(os.environ.get("GRACE_HOURS", "24"))          # льготны
 NOTIFY_BEFORE_DAYS = float(os.environ.get("NOTIFY_BEFORE_DAYS", "3"))  # за сколько дней предупреждать
 SUB_CHECK_INTERVAL = int(os.environ.get("SUB_CHECK_INTERVAL", "600"))  # как часто проверять подписки (сек)
 
-# 💳 Внутренний кассир. По умолчанию ВЫКЛЮЧЕН: кассир должен работать ровно в одном
-# месте. Если он поднят отдельным сервисом, второй polling тем же токеном даёт вечный
-# TelegramConflictError. Включай (INTERNAL_CASHIER=1) только если кассира нет отдельно.
-INTERNAL_CASHIER = os.environ.get("INTERNAL_CASHIER", "0").strip().lower() in {"1", "true", "yes", "on"}
+# 💳 Внутренний кассир. Режимы:
+#   "auto" (по умолчанию) — если задан CASHIER_TOKEN, кассир поднимается внутри этого же
+#                           сервиса (как в v8). Перед запуском проверяем, не опрашивает ли
+#                           токен кто-то ещё: занят → внутренний не стартует, чтобы не было
+#                           TelegramConflictError.
+#   "on"   — включать обязательно (токен занят → пишем ошибку и не стартуем).
+#   "off"  — не включать (режим двух сервисов: кассир живёт отдельным сервисом).
+_cashier_env = os.environ.get("INTERNAL_CASHIER", "auto").strip().lower()
+if _cashier_env in ("", "auto", "-1"):
+    INTERNAL_CASHIER_MODE = "auto"
+elif _cashier_env in ("1", "true", "yes", "on", "вкл"):
+    INTERNAL_CASHIER_MODE = "on"
+elif _cashier_env in ("0", "false", "no", "off", "выкл"):
+    INTERNAL_CASHIER_MODE = "off"
+else:
+    INTERNAL_CASHIER_MODE = "auto"
+INTERNAL_CASHIER = INTERNAL_CASHIER_MODE  # для обратной совместимости и логов
+BOTHOST_VERSION = "9.3"
 
 DATA_DIR = Path(os.environ.get("DATA_DIR", "/app/data"))
 BOTS_DIR = DATA_DIR / "bots"
@@ -1038,10 +1053,14 @@ async def restore_bot_files(bot_id: int):
                     pass
         with zipfile.ZipFile(tmp, "r") as z:
             safe_extract_zip(z, bot_dir)
-        ep = find_entry_point(bot_dir)
-        if ep:
-            update_bot_entry(bot_id, ep)
-        logger.info("♻️ Файлы бота #%s восстановлены из Telegram Storage", bot_id)
+        # ВАЖНО: не перезаписываем выбранную пользователем точку входа. Раньше здесь
+        # стоял find_entry_point(), и после восстановления из архива точка входа
+        # подменялась «первым по алфавиту» файлом (например apscheduler.py) — бот
+        # перестарался запускаться.
+        b = get_bot(bot_id)
+        stored = b[7] if b and len(b) > 7 else ""
+        ep = resolve_entry_point(bot_id, bot_dir, stored)
+        logger.info("♻️ Файлы бота #%s восстановлены из Telegram Storage (точка входа: %s)", bot_id, ep or "не найдена")
         return True
     except Exception as e:
         logger.warning("Не удалось восстановить файлы бота #%s: %s", bot_id, e)
@@ -1147,6 +1166,23 @@ def list_bot_files(bot_id):
     return files
 
 
+def crash_hint(bot_id, code, logs=""):
+    """Объясняет частые причины падения прямо в уведомлении."""
+    b = get_bot(bot_id)
+    ep = (b[7] if b and len(b) > 7 else "") or ""
+    bot_dir = BOTS_DIR / f"bot_{bot_id}"
+    lines = []
+    if code == 0:
+        lines.append("💡 Код 0 = скрипт завершился сам, сразу после запуска.")
+        if ep and not looks_like_entry_point(bot_dir, ep):
+            lines.append(f"⚠️ Похоже, точка входа <code>{html.escape(ep)}</code> — это не файл запуска "
+                         "(библиотека внутри проекта). Открой «📄 Точка входа» и выбери свой основной файл.")
+        else:
+            lines.append("Проверь, что скрипт запускает бота (polling/webhook) и не заканчивается сразу.")
+    text = "".join(l + "\n" for l in lines)
+    return text + "\n"
+
+
 async def monitor_bots():
     while True:
         try:
@@ -1174,8 +1210,9 @@ async def monitor_bots():
                         else:
                             if uid != OWNER_ID:
                                 logs = get_bot_logs(bot_id, 15)
+                                hint = crash_hint(bot_id, code, logs)
                                 try:
-                                    await bot.send_message(uid, f"⚠️ <b>Бот #{bot_id} упал!</b>\nКод: {code}\n<pre>{html.escape(logs[-500:])}</pre>", parse_mode="HTML")
+                                    await bot.send_message(uid, f"⚠️ <b>Бот #{bot_id} упал!</b>\nКод: {code}\n{hint}<pre>{html.escape(logs[-500:])}</pre>", parse_mode="HTML")
                                 except Exception:
                                     pass
                 else:
@@ -1311,7 +1348,11 @@ def note_persistence(db_existed_before: bool):
         logger.warning("⚠️ База есть, а метки прошлого запуска нет — возможно, %s пересоздаётся. "
                        "Проверь Railway → Volume с mount path %s.", DATA_DIR, DATA_DIR)
     else:
-        logger.info("💾 Первый запуск: база создаётся в %s.", DATA_DIR)
+        logger.info("💾 База не найдена — создаю в %s.", DATA_DIR)
+        if str(DATA_DIR).startswith("/app"):
+            logger.warning("⚠️ Если это НЕ самый первый деплой, значит Volume не подключён: "
+                           "данные прошлого запуска (подписки, боты, файлы) потеряны. "
+                           "Railway → сервис → Settings → Volumes → Mount path %s.", DATA_DIR)
 
 
 def note_startup_time():
@@ -1782,7 +1823,14 @@ def safe_extract_zip(zf: zipfile.ZipFile, destination: Path):
 
 
 def get_python_files(bot_dir: Path) -> list[str]:
-    """Все возможные точки входа внутри папки бота."""
+    """Все возможные точки входа внутри папки бота, самые вероятные — первыми.
+
+    Раньше сортировка была «по имени файла», и в проекте, где рядом с ботом лежит
+    скопированная библиотека (например apscheduler.py), точкой входа выбирался именно
+    библиотечный файл: он мгновенно завершался, и это выглядело как цикл падений.
+    Теперь смотрим ещё и содержимое: `if __name__ == "__main__"`, импорт фреймворка,
+    запуск polling.
+    """
     result = []
     for p in bot_dir.rglob("*.py"):
         try:
@@ -1794,9 +1842,61 @@ def get_python_files(bot_dir: Path) -> list[str]:
         if rel.name in {"wrapper.py", "cashier.py"}:
             continue
         result.append(rel.as_posix())
-    preferred = {"main.py": 0, "bot.py": 1, "app.py": 2, "run.py": 3, "start.py": 4, "user_bot.py": 5}
-    result.sort(key=lambda x: (preferred.get(Path(x).name, 50), len(Path(x).parts), x.lower()))
+    result.sort(key=lambda x: (-entry_score(bot_dir / x), entry_name_preference(x), len(Path(x).parts), x.lower()))
     return result
+
+
+# Имена модулей, которые почти всегда являются библиотекой, а не точкой входа.
+LIBRARY_FILENAMES = {
+    "apscheduler", "sqlalchemy", "aiohttp", "requests", "dotenv", "uvicorn", "fastapi", "flask",
+    "django", "numpy", "pandas", "yaml", "redis", "pymongo", "celery", "alembic", "kombu",
+    "billiard", "pytz", "dateutil", "six", "attr", "attrs", "click", "jinja2", "werkzeug",
+    "starlette", "pydantic", "httpx", "urllib3", "certifi", "idna", "chardet", "bs4", "lxml",
+    "cv2", "pil", "openai", "groq", "telegram", "telebot", "aiogram", "discord", "logging",
+    "typing", "asyncio", "sqlite3", "json", "config", "settings", "utils", "helpers", "models",
+    "database", "middlewares", "middleware", "keyboards", "filters", "states", "handlers",
+    "admin", "user", "loader", "scheduler", "tasks", "exceptions", "constants", "texts",
+}
+
+# Приоритет по имени файла (добавляется к оценке содержимого).
+ENTRY_NAME_BONUS = {
+    "main.py": 30, "user_bot.py": 30, "bot.py": 25, "app.py": 20, "run.py": 18,
+    "start.py": 15, "server.py": 12, "index.py": 10, "manage.py": 10,
+}
+
+
+def entry_name_preference(rel: str) -> int:
+    return 0 if Path(rel).name.lower() in ENTRY_NAME_BONUS else 5
+
+
+def entry_score(path: Path) -> int:
+    """Насколько файл похож на точку входа: 0 — библиотека, 120 — типичный запуск бота."""
+    name = path.name.lower()
+    score = ENTRY_NAME_BONUS.get(name, 0)
+    if name in LIBRARY_FILENAMES:
+        score -= 1000
+    try:
+        text = path.read_text(encoding="utf-8", errors="ignore")[:8000]
+    except Exception:
+        return score
+    if "__main__" in text:
+        score += 100
+    if re.search(r"\b(aiogram|telebot|telegram|discord|vkbottle|maxapi|pyrogram|telethon)\b", text):
+        score += 40
+    if re.search(r"(start_polling|run_polling|infinity_polling|\.polling\(|executor\.start_polling|asyncio\.run\()", text):
+        score += 25
+    if re.search(r"(Dispatcher\(|Updater\(|Application\.builder\(\)|\bBot\()", text):
+        score += 20
+    if re.search(r"(BOT_TOKEN|bot_token|os\.environ\.get\()", text):
+        score += 10
+    if "__main__" not in text and score < 40:
+        score -= 20
+    return score
+
+
+def looks_like_entry_point(bot_dir: Path, rel: str) -> bool:
+    """Похоже ли, что выбранный файл действительно запускает бота."""
+    return entry_score(bot_dir / rel) >= 40
 
 
 def find_entry_point(bot_dir: Path) -> str:
@@ -1974,10 +2074,16 @@ async def handle_token(message: types.Message, state: FSMContext):
                 f"⚠️ <b>Бот #{bid} загружен, но .py файл не найден.</b>\n\n"
                 "Добавь Python-файл через «📁 Файлы».")
         else:
+            # Если автоопределение взяло библиотечный файл (например apscheduler.py),
+            # честно предупреждаем: бот запустится и сразу завершится.
+            warn = "" if looks_like_entry_point(bot_dir, ep) else (
+                "\n\n⚠️ <b>Похоже, это не файл запуска</b> (в нём нет "
+                "<code>if __name__ == \"__main__\"</code> и запуска бота).\n"
+                "Нажми «📄 Точка входа» и выбери свой основной файл.")
             await msg.edit_text(
                 f"✅ <b>Бот #{bid} развёрнут!</b>\n"
                 f"🚀 Точка входа: <code>{html.escape(ep)}</code>\n"
-                f"{slot_line}\n\n"
+                f"{slot_line}{warn}\n\n"
                 f"Если нужно запустить другой .py файл — открой «🤖 Мои проекты» → бот → «📄 Точка входа».",
                 reply_markup=InlineKeyboardMarkup(inline_keyboard=[
                     [InlineKeyboardButton(text="📄 Точка входа", callback_data=f"entry:{bid}")],
@@ -2479,10 +2585,18 @@ async def cb_start(call: types.CallbackQuery, state: FSMContext = None):
         await call.message.answer(f"✅ Бот #{bid} запущен!", parse_mode="HTML")
     else:
         logs = html.escape(get_bot_logs(bid, 30)[-1500:] or "пусто")
+        b2 = get_bot(bid) or b
+        ep_now = (b2[7] if len(b2) > 7 else "") or ""
+        warn = ""
+        if ep_now and not looks_like_entry_point(BOTS_DIR / f"bot_{bid}", ep_now):
+            warn = (f"\n\n⚠️ Точка входа <code>{html.escape(ep_now)}</code> похожа на библиотечный файл "
+                    "(нет <code>if __name__ == \"__main__\"</code> и запуска бота). "
+                    "Нажми «📄 Точка входа» и выбери свой основной файл.")
         await call.message.answer(
-            f"❌ Бот #{bid} не запустился\n<pre>{logs}</pre>",
+            f"❌ Бот #{bid} не запустился{warn}\n<pre>{logs}</pre>",
             parse_mode="HTML",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="📄 Точка входа", callback_data=f"entry:{bid}")],
                 [InlineKeyboardButton(text="📄 Логи", callback_data=f"logs:{bid}")],
                 [InlineKeyboardButton(text="« К боту", callback_data=f"bot:{bid}")]]))
 
@@ -3749,14 +3863,16 @@ async def main():
     acquire_instance_lock()
     note_persistence(db_existed_before)
     note_startup_time()
-    logger.info("=" * 50)
-    logger.info("🤖 BotHost v9.0 | pid=%s | db=%s", os.getpid(), DB_PATH)
+    logger.info("=" * 60)
+    logger.info("🤖 BotHost v%s | pid=%s | db=%s", BOTHOST_VERSION, os.getpid(), DB_PATH)
     logger.info(f"👤 Владелец: {OWNER_ID}")
     logger.info(f"🔗 Кассир: @{VERIFIER_BOT_USERNAME}")
+    logger.info(f"💳 Режим кассира: {INTERNAL_CASHIER_MODE} "
+                f"({'кассир внутри сервиса' if INTERNAL_CASHIER_MODE in ('auto', 'on') else 'отдельный сервис'})")
     logger.info(f"📢 SYNC канал: {SYNC_CHANNEL_ID}")
     logger.info(f"📦 FILE STORAGE канал: {FILE_STORAGE_CHANNEL_ID or 'не задан'}")
     logger.info(f"⏳ Льготный период: {GRACE_HOURS} ч | напоминания за {NOTIFY_BEFORE_DAYS:g} дн.")
-    logger.info("=" * 50)
+    logger.info("=" * 60)
     if str(DATA_DIR).startswith("/app") and os.name == "posix":
         logger.info("💡 Важно: подключи Railway Volume на %s — иначе подписки и боты исчезнут при редеплое.", DATA_DIR)
 
@@ -3773,24 +3889,23 @@ async def main():
     asyncio.create_task(auto_backup())
     asyncio.create_task(monitor_subscriptions())
 
-    # Кассир должен работать РОВНО в одном месте. Внутренний запуск по умолчанию
-    # выключен: если кассир поднят отдельным сервисом, второй polling тем же токеном
-    # даёт вечный TelegramConflictError.
+    # Кассир должен работать РОВНО в одном месте, поэтому перед запуском внутреннего
+    # кассира проверяем, не опрашивает ли его токен кто-то ещё.
     cashier_task = None
     cashier_token_present = bool(os.environ.get("CASHIER_TOKEN", "").strip())
-    if INTERNAL_CASHIER and cashier_token_present:
+    want_internal = INTERNAL_CASHIER_MODE in ("auto", "on")
+    if want_internal and cashier_token_present:
         if importlib.util.find_spec("cashier") is None:
-            logger.error("❌ INTERNAL_CASHIER=1, но модуль cashier.py не найден рядом с bot.py — "
-                         "внутренний кассир не запущен.")
+            logger.error("❌ Внутренний кассир не запущен: рядом с bot.py нет cashier.py "
+                         "(в образе должен быть файл кассира).")
         else:
             free, why = await cashier_token_is_free(os.environ.get("CASHIER_TOKEN", "").strip())
             if not free:
                 logger.error("❌ Внутренний кассир НЕ запущен: %s.\n"
-                             "   Значит, кассир уже где-то работает (второй сервис, старая реплика или "
-                             "локальный запуск). Оставь его ТОЛЬКО в одном месте:\n"
-                             "   • либо здесь (INTERNAL_CASHIER=1) — тогда удали сервис/переменную кассира во втором месте;\n"
-                             "   • либо отдельным сервисом — тогда убери INTERNAL_CASHIER и CASHIER_TOKEN отсюда.\n"
-                             "   Пока работает второй экземпляр — оплата идёт через него, конфликтов не будет.", why)
+                             "   Кассир уже работает в другом месте (второй сервис, старая реплика или "
+                             "локальный запуск) — оплата идёт через него, конфликтов не будет.\n"
+                             "   Нужен кассир только здесь: останови второй экземпляр.\n"
+                             "   Нужен кассир отдельным сервисом: поставь INTERNAL_CASHIER=0.", why)
             else:
                 async def run_internal_cashier():
                     while True:
@@ -3807,14 +3922,14 @@ async def main():
 
                 cashier_task = asyncio.create_task(run_internal_cashier(), name="internal-cashier")
                 logger.info("✅ Токен кассира свободен (%s) — внутренний кассир стартует", why)
-    elif INTERNAL_CASHIER and not cashier_token_present:
-        logger.warning("⚠️ INTERNAL_CASHIER=1, но CASHIER_TOKEN не задан — внутренний кассир не запущен")
+    elif want_internal and not cashier_token_present:
+        logger.warning("⚠️ Внутренний кассир не запущен: нет CASHIER_TOKEN. "
+                       "Оплата пойдёт через отдельный сервис кассира, если он есть.")
     elif cashier_token_present:
-        logger.warning("⚠️ CASHIER_TOKEN задан, но внутренний кассир ВЫКЛЮЧЕН (INTERNAL_CASHIER != 1). "
-                       "Это правильно, если кассир работает отдельным сервисом: один токен — один polling. "
-                       "Нужен кассир внутри этого сервиса — поставь INTERNAL_CASHIER=1 и убери его из второго сервиса.")
+        logger.info("ℹ️ CASHIER_TOKEN задан, но INTERNAL_CASHIER=0 — внутренний кассир выключен "
+                    "по настройке. Это режим двух сервисов: кассир работает отдельно.")
     else:
-        logger.info("ℹ️ Внутренний кассир выключен — оплата идёт через отдельный сервис кассира.")
+        logger.info("ℹ️ Внутренний кассир не задан — оплата идёт через отдельный сервис кассира.")
 
     try:
         while True:
