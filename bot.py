@@ -1,8 +1,35 @@
 """
-🤖 BotHost v8.0 Stable
-✅ Исправлена ошибка Webhook (bot.delete_webhook)
-✅ Починены неработающие кнопки (сброс FSM)
-✅ Интеграция с ботом-кассиром через закрытый Telegram-канал
+🤖 BotHost v9.0 — Subscriptions Edition
+────────────────────────────────────────────────────────────────
+Что изменилось по сравнению с v8.0:
+
+✅ ГЛАВНЫЙ ФИКС: купленный слот больше не «исчезает».
+   • Подписка хранится в отдельной таблице subscriptions.
+   • Продление СТАКАЕТСЯ: новый срок прибавляется к текущей дате окончания,
+     остаток дней не сгорает.
+   • «➕ Ещё один слот» — отдельная покупка, если нужно запускать больше ботов
+     (раньше вторая покупка молча продлевала первую, и второй бот был невозможен).
+   • Старые записи из таблицы slots автоматически переносятся (миграция).
+   • Льготный период 24 ч после истечения — боты не падают в ту же секунду.
+
+✅ Напоминания: за 3 дня, за 1 день и после истечения — с кнопками выбора
+   тарифа продления прямо в уведомлении (в 1 клик).
+
+✅ Два типа тарифа:
+   🧩 «Слот на 1 бота»    — 1 подписка = 1 работающий бот.
+   🚀 «Хостинг без лимита» — ботов сколько угодно, срок общий.
+
+✅ Удобства от себя:
+   • «📦 Моя подписка»: прогресс-бар, сколько слотов занято, дата окончания.
+   • Динамическая кнопка «⚠️ Продлить подписку» в главном меню.
+   • Админ: «📦 Подписки» (список/отзыв/+7 и +30 дней) и «🎁 Выдать подписку».
+   • Промокод может выдавать любой тариф, включая хостинг.
+   • Автоочистка мусорных записей и напоминания без спама (флаги в БД).
+   • Если бот остановлен из-за истёкшей подписки — придёт уведомление
+     с кнопками продления, а файлы и переменные останутся на месте.
+
+⚠️ Обязательно подключи Railway Volume на DATA_DIR (/app/data), иначе при
+   редеплое вместе с файлами пропадут и подписки. В логе при старте есть подсказка.
 """
 
 import os
@@ -51,11 +78,16 @@ OWNER_ID = int(os.environ.get("OWNER_ID", "8269807543"))
 OWNER_USERNAME = os.environ.get("OWNER_USERNAME", "ivan_unreal")
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
 
-VERIFIER_BOT_USERNAME = os.environ.get("VERIFIER_BOT", "BotHostoplatiBot").lstrip("@") 
+VERIFIER_BOT_USERNAME = os.environ.get("VERIFIER_BOT", "BotHostoplatiBot").lstrip("@")
 # ID закрытого канала, где сидят оба бота (начинается с -100)
 SYNC_CHANNEL_ID = int(os.environ.get("SYNC_CHANNEL_ID", "0"))
 SYNC_SECRET = os.environ.get("SYNC_SECRET", "").strip()
 FILE_STORAGE_CHANNEL_ID = int(os.environ.get("BOT_FILES_STORAGE_CHANNEL_ID", os.environ.get("STORAGE_CHANNEL_ID", "0")))
+
+# ⏳ Подписки
+GRACE_HOURS = int(os.environ.get("GRACE_HOURS", "24"))          # льготный период после истечения
+NOTIFY_BEFORE_DAYS = float(os.environ.get("NOTIFY_BEFORE_DAYS", "3"))  # за сколько дней предупреждать
+SUB_CHECK_INTERVAL = int(os.environ.get("SUB_CHECK_INTERVAL", "600"))  # как часто проверять подписки (сек)
 
 DATA_DIR = Path(os.environ.get("DATA_DIR", "/app/data"))
 BOTS_DIR = DATA_DIR / "bots"
@@ -64,10 +96,34 @@ DB_PATH = DATA_DIR / "bot.db"
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 BOTS_DIR.mkdir(parents=True, exist_ok=True)
 
+# ───────────────────────────────────────────────────────────────
+# 💎 КАТАЛОГ ТАРИФОВ
+# kind: "bot"  — слот на одного бота
+#       "host" — хостинг: ботов без лимита
+# ───────────────────────────────────────────────────────────────
+
 PLANS = {
-    "week":   {"name": "Неделя",    "stars": 15, "days": 7,  "emoji": "📅"},
-    "2weeks": {"name": "2 недели",  "stars": 25, "days": 14, "emoji": "🗓"},
-    "month":  {"name": "Месяц",     "stars": 50, "days": 30, "emoji": "💎"},
+    # 🧩 Слот на 1 бота
+    "week":   {"name": "Неделя",   "stars": 15, "days": 7,  "kind": "bot",  "emoji": "📅"},
+    "2weeks": {"name": "2 недели", "stars": 25, "days": 14, "kind": "bot",  "emoji": "🗓"},
+    "month":  {"name": "Месяц",    "stars": 50, "days": 30, "kind": "bot",  "emoji": "💎"},
+    # 🚀 Хостинг без лимита ботов
+    "host_week":   {"name": "Хостинг · Неделя",   "stars": 39,  "days": 7,  "kind": "host", "emoji": "🚀"},
+    "host_2weeks": {"name": "Хостинг · 2 недели", "stars": 65,  "days": 14, "kind": "host", "emoji": "🛰"},
+    "host_month":  {"name": "Хостинг · Месяц",    "stars": 130, "days": 30, "kind": "host", "emoji": "🌌"},
+}
+
+KINDS = {
+    "bot": {
+        "name": "Слот на 1 бота",
+        "emoji": "🧩",
+        "hint": "Одна подписка = один работающий бот. Удалил бота — слот освободился.",
+    },
+    "host": {
+        "name": "Хостинг без лимита ботов",
+        "emoji": "🚀",
+        "hint": "Загружай сколько угодно ботов, пока активна подписка. Выгодно от 3 ботов.",
+    },
 }
 
 BOT_START_TIME = time.time()
@@ -81,12 +137,15 @@ start_locks: Dict[int, asyncio.Lock] = {}
 
 groq_client = None
 if GROQ_AVAILABLE and GROQ_API_KEY:
-    try: groq_client = AsyncGroq(api_key=GROQ_API_KEY)
-    except Exception as e: logger.error(f"⚠️ Ошибка ИИ: {e}")
+    try:
+        groq_client = AsyncGroq(api_key=GROQ_API_KEY)
+    except Exception as e:
+        logger.error(f"⚠️ Ошибка ИИ: {e}")
 
 # ═══════════════════════════════════════════════════════════════
 # 💾 БАЗА ДАННЫХ
 # ═══════════════════════════════════════════════════════════════
+
 def _db_connect():
     conn = sqlite3.connect(DB_PATH, timeout=5, check_same_thread=False)
     conn.row_factory = sqlite3.Row
@@ -97,9 +156,7 @@ def _db_connect():
 
 
 def _db_retry(fn, attempts=10):
-    """Run a DB operation with short bounded retries.
-    The cashier has its own storage, so BotHost's DB is no longer shared with it.
-    """
+    """Операция с короткими повторными попытками при блокировке БД."""
     last = None
     for i in range(attempts):
         conn = None
@@ -133,6 +190,10 @@ def _db_read(fn):
         conn.close()
 
 
+# Явный порядок колонок подписок (не завязываемся на порядок в старых БД)
+SUB_COLS = "id,user_id,kind,plan,expires_at,period_days,reminded_3d,reminded_1d,expired_notified,created_at"
+
+
 def init_db():
     def setup(conn):
         c = conn.cursor()
@@ -141,6 +202,9 @@ def init_db():
         c.execute("PRAGMA busy_timeout=5000")
         c.execute("CREATE TABLE IF NOT EXISTS users (user_id INTEGER PRIMARY KEY, username TEXT, full_name TEXT, is_admin INTEGER DEFAULT 0, is_banned INTEGER DEFAULT 0, created_at TEXT)")
         c.execute("CREATE TABLE IF NOT EXISTS slots (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, plan TEXT, expires_at TEXT, created_at TEXT, gift_id TEXT)")
+        c.execute("CREATE TABLE IF NOT EXISTS subscriptions (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, kind TEXT NOT NULL DEFAULT 'bot', plan TEXT NOT NULL, expires_at TEXT NOT NULL, period_days INTEGER DEFAULT 0, reminded_3d INTEGER DEFAULT 0, reminded_1d INTEGER DEFAULT 0, expired_notified INTEGER DEFAULT 0, created_at TEXT NOT NULL)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_subs_user ON subscriptions(user_id, expires_at)")
+        c.execute("CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT)")
         c.execute("CREATE TABLE IF NOT EXISTS bots (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, filename TEXT, bot_token TEXT, status TEXT DEFAULT 'stopped', created_at TEXT, is_frozen INTEGER DEFAULT 0, entry_point TEXT DEFAULT 'user_bot.py', auto_restart INTEGER DEFAULT 0, env_vars TEXT DEFAULT '{}')")
         c.execute("CREATE TABLE IF NOT EXISTS payment_requests (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, username TEXT, full_name TEXT, plan TEXT, status TEXT DEFAULT 'pending', created_at TEXT, processed_at TEXT)")
         c.execute("CREATE TABLE IF NOT EXISTS promocodes (id INTEGER PRIMARY KEY AUTOINCREMENT, code TEXT UNIQUE, plan TEXT, uses_left INTEGER, created_at TEXT)")
@@ -148,6 +212,7 @@ def init_db():
         c.execute("CREATE TABLE IF NOT EXISTS auto_grants (grant_id TEXT PRIMARY KEY, user_id INTEGER NOT NULL, plan TEXT NOT NULL, created_at TEXT NOT NULL)")
         c.execute("CREATE TABLE IF NOT EXISTS bot_archives (id INTEGER PRIMARY KEY AUTOINCREMENT, bot_id INTEGER NOT NULL, message_id INTEGER NOT NULL, file_id TEXT NOT NULL, filename TEXT NOT NULL, created_at TEXT NOT NULL)")
         c.execute("CREATE INDEX IF NOT EXISTS idx_bot_archives_bot ON bot_archives(bot_id, id DESC)")
+
         cols = {row[1] for row in c.execute("PRAGMA table_info(bots)").fetchall()}
         if "entry_point" not in cols:
             c.execute("ALTER TABLE bots ADD COLUMN entry_point TEXT DEFAULT 'user_bot.py'")
@@ -156,12 +221,37 @@ def init_db():
         if "env_vars" not in cols:
             c.execute("ALTER TABLE bots ADD COLUMN env_vars TEXT DEFAULT '{}'")
 
+        pcols = {row[1] for row in c.execute("PRAGMA table_info(payment_requests)").fetchall()}
+        if "mode" not in pcols:
+            c.execute("ALTER TABLE payment_requests ADD COLUMN mode TEXT DEFAULT 'extend'")
+
+        # Миграция старой модели слотов в подписки (однократно).
+        migrated = c.execute("SELECT v FROM meta WHERE k='slots_migrated'").fetchone()
+        if not migrated:
+            now = datetime.now()
+            rows = c.execute("SELECT user_id, plan, expires_at FROM slots WHERE expires_at > ?", (now.isoformat(),)).fetchall()
+            moved = 0
+            for uid, plan, expires_at in rows:
+                if plan not in PLANS:
+                    continue
+                p = PLANS[plan]
+                c.execute(
+                    "INSERT INTO subscriptions(user_id,kind,plan,expires_at,period_days,created_at) VALUES(?,?,?,?,?,?)",
+                    (uid, p["kind"], plan, expires_at, p["days"], now.isoformat()),
+                )
+                moved += 1
+            c.execute("INSERT OR REPLACE INTO meta(k,v) VALUES('slots_migrated',?)", (now.isoformat(),))
+            if moved:
+                logger.info("♻️ Миграция слотов в подписки: перенесено %s активных записей", moved)
+
     _db_retry(setup, attempts=20)
 
 
 def get_db():
     return _db_connect()
 
+
+# ─────────────── ПОЛЬЗОВАТЕЛИ ───────────────
 
 def create_user(uid, uname, fname=""):
     _db_retry(lambda conn: conn.execute(
@@ -221,30 +311,177 @@ def get_all_admins():
     return _db_read(lambda conn: conn.execute("SELECT user_id, username, full_name FROM users WHERE is_admin = 1 AND user_id != ?", (OWNER_ID,)).fetchall())
 
 
+# ═══════════════════════════════════════════════════════════════
+# 📦 ПОДПИСКИ (замена «сгорающих слотов»)
+# ═══════════════════════════════════════════════════════════════
+
+def fmt_dt(dt):
+    return dt.strftime("%d.%m.%Y %H:%M")
+
+
+def human_left(expires_at):
+    """Сколько осталось до даты окончания — человеческим языком."""
+    try:
+        exp = datetime.fromisoformat(expires_at)
+    except Exception:
+        return "—"
+    sec = (exp - datetime.now()).total_seconds()
+    if sec <= 0:
+        return "истекла"
+    d = int(sec // 86400)
+    h = int((sec % 86400) // 3600)
+    m = int((sec % 3600) // 60)
+    if d:
+        return f"{d} д {h} ч"
+    if h:
+        return f"{h} ч {m} мин"
+    return f"{m} мин"
+
+
+def bar(ratio, width=10):
+    ratio = max(0.0, min(1.0, ratio))
+    filled = int(round(ratio * width))
+    return "▰" * filled + "▱" * (width - filled)
+
+
+def get_active_subs(uid, include_grace=True):
+    """Активные подписки. include_grace — учитывать льготный период после истечения."""
+    limit = datetime.now() - timedelta(hours=GRACE_HOURS if include_grace else 0)
+    return _db_read(lambda conn: conn.execute(
+        f"SELECT {SUB_COLS} FROM subscriptions WHERE user_id = ? AND expires_at > ? ORDER BY expires_at ASC",
+        (uid, limit.isoformat())).fetchall())
+
+
+def add_subscription(uid, pid, grant_id=None, mode="extend"):
+    """Создаёт или ПРОДЛЕВАЕТ подписку.
+
+    mode="extend" — продление: срок прибавляется к дате окончания активной
+                    подписки того же типа, остаток дней НЕ сгорает.
+    mode="new"    — дополнительный слот: создаётся отдельная подписка
+                    (нужно, чтобы запускать больше ботов одновременно).
+    Для kind="host" всегда действует extend — хостинг один на пользователя.
+
+    Возвращает dict: {'sub_id', 'expires_at', 'extended', 'kind', 'mode'}
+    или None, если grant_id уже был использован.
+    """
+    if pid not in PLANS:
+        raise ValueError(f"Неизвестный тариф: {pid}")
+    p = PLANS[pid]
+    kind, days = p["kind"], p["days"]
+    if kind == "host":
+        mode = "extend"
+    now = datetime.now()
+
+    def op(conn):
+        if grant_id:
+            if conn.execute("SELECT 1 FROM auto_grants WHERE grant_id = ?", (grant_id,)).fetchone():
+                return None
+            conn.execute("INSERT INTO auto_grants(grant_id,user_id,plan,created_at) VALUES(?,?,?,?)",
+                         (grant_id, uid, pid, now.isoformat()))
+        conn.execute("INSERT INTO users(user_id,username,full_name,created_at) VALUES(?,'','',?) ON CONFLICT(user_id) DO NOTHING",
+                     (uid, now.isoformat()))
+        row = None
+        if mode == "extend":
+            # Продлеваем ту подписку, которая истекает раньше всех.
+            row = conn.execute(
+                "SELECT id, expires_at FROM subscriptions WHERE user_id=? AND kind=? AND expires_at > ? ORDER BY expires_at ASC LIMIT 1",
+                (uid, kind, now.isoformat())).fetchone()
+        if row:
+            base = max(datetime.fromisoformat(row[1]), now)
+            exp = base + timedelta(days=days)
+            conn.execute(
+                "UPDATE subscriptions SET expires_at=?, plan=?, period_days=?, reminded_3d=0, reminded_1d=0, expired_notified=0 WHERE id=?",
+                (exp.isoformat(), pid, days, row[0]))
+            return {"sub_id": row[0], "expires_at": exp, "extended": True, "kind": kind, "plan": pid, "mode": "extend"}
+        exp = now + timedelta(days=days)
+        cur = conn.execute(
+            "INSERT INTO subscriptions(user_id,kind,plan,expires_at,period_days,created_at) VALUES(?,?,?,?,?,?)",
+            (uid, kind, pid, exp.isoformat(), days, now.isoformat()))
+        return {"sub_id": cur.lastrowid, "expires_at": exp, "extended": False, "kind": kind, "plan": pid, "mode": mode}
+
+    return _db_retry(op)
+
+
+def get_limits(uid):
+    """Лимиты пользователя.
+
+    unlimited=True  — хостинг (или админ): ботов сколько угодно
+    slots=<N>       — доступно N одновременно работающих ботов
+    until           — крайняя дата окончания среди подписок
+    """
+    if is_admin(uid):
+        return {"unlimited": True, "slots": None, "until": None, "host": True, "subs": []}
+    subs = get_active_subs(uid, include_grace=True)
+    host = [s for s in subs if s[2] == "host"]
+    bot_subs = [s for s in subs if s[2] == "bot"]
+    until = max((s[4] for s in subs), default=None)
+    if host:
+        return {"unlimited": True, "slots": None, "until": until, "host": True, "subs": subs}
+    return {"unlimited": False, "slots": len(bot_subs), "until": until, "host": False, "subs": subs}
+
+
 def has_active_slot(uid):
+    """Есть ли вообще право запускать ботов (с учётом льготного периода)."""
     if is_admin(uid):
         return True
-    now = datetime.now().isoformat()
-    row = _db_read(lambda conn: conn.execute("SELECT COUNT(*) FROM slots WHERE user_id = ? AND expires_at > ?", (uid, now)).fetchone())
+    row = _db_read(lambda conn: conn.execute(
+        "SELECT COUNT(*) FROM subscriptions WHERE user_id=? AND expires_at > ?",
+        (uid, (datetime.now() - timedelta(hours=GRACE_HOURS)).isoformat())).fetchone())
     return bool(row and row[0] > 0)
 
 
-def get_active_slots(uid):
+def can_add_bot(uid):
+    """Можно ли загрузить ещё одного бота. → (bool, причина)"""
     if is_admin(uid):
-        return [(0, uid, "month", "2099-12-31", datetime.now().isoformat(), "admin")]
-    now = datetime.now().isoformat()
-    return _db_read(lambda conn: conn.execute("SELECT * FROM slots WHERE user_id = ? AND expires_at > ?", (uid, now)).fetchall())
+        return True, ""
+    lim = get_limits(uid)
+    if not lim["subs"]:
+        return False, "нет активной подписки"
+    if lim["unlimited"]:
+        return True, ""
+    used = len(get_user_bots(uid))
+    if used >= lim["slots"]:
+        return False, f"заняты все слоты ({used}/{lim['slots']})"
+    return True, ""
 
 
-def create_slot(uid, plan):
-    now = datetime.now()
-    exp = now + timedelta(days=PLANS[plan]["days"])
-    _db_retry(lambda conn: conn.execute("INSERT INTO slots (user_id, plan, expires_at, created_at) VALUES (?, ?, ?, ?)", (uid, plan, exp.isoformat(), now.isoformat())))
+def users_expiring_soon():
+    soon = (datetime.now() + timedelta(days=NOTIFY_BEFORE_DAYS)).isoformat()
+    return _db_read(lambda conn: conn.execute(
+        f"SELECT {SUB_COLS} FROM subscriptions WHERE expires_at < ? AND expires_at > ? ORDER BY expires_at ASC",
+        (soon, datetime.now().isoformat())).fetchall())
 
+
+def cleanup_subscriptions(days=60):
+    """Удаляем давно истёкшие подписки, чтобы БД не пухла."""
+    border = (datetime.now() - timedelta(days=days)).isoformat()
+    return _db_retry(lambda conn: conn.execute("DELETE FROM subscriptions WHERE expires_at < ?", (border,)).rowcount)
+
+
+def has_sub_of_kind(uid, kind):
+    """Есть ли активная подписка указанного типа (для выбора «продлить / новый слот»)."""
+    row = _db_read(lambda conn: conn.execute(
+        "SELECT COUNT(*) FROM subscriptions WHERE user_id=? AND kind=? AND expires_at > ?",
+        (uid, kind, datetime.now().isoformat())).fetchone())
+    return bool(row and row[0] > 0)
+
+
+# ── Совместимость со старым кодом/кассиром ──
+def create_slot(uid, plan, mode="extend"):
+    return add_subscription(uid, plan, mode=mode)
+
+
+def get_active_slots(uid):
+    """Оставлено для совместимости: возвращает строки подписок."""
+    return get_active_subs(uid)
+
+
+# ─────────────── БОТЫ ───────────────
 
 def save_bot(uid, fname, token, ep="user_bot.py"):
     def op(conn):
-        cur = conn.execute("INSERT INTO bots (user_id, filename, bot_token, created_at, entry_point) VALUES (?, ?, ?, ?, ?)", (uid, fname, token, datetime.now().isoformat(), ep))
+        cur = conn.execute("INSERT INTO bots (user_id, filename, bot_token, created_at, entry_point) VALUES (?, ?, ?, ?, ?)",
+                           (uid, fname, token, datetime.now().isoformat(), ep))
         return cur.lastrowid
     return _db_retry(op)
 
@@ -296,9 +533,12 @@ def delete_bot_record(bid):
     _db_retry(lambda conn: conn.execute("DELETE FROM bots WHERE id = ?", (bid,)))
 
 
-def create_payment_request(uid, uname, fname, plan):
+# ─────────────── ЗАЯВКИ / ПРОМОКОДЫ / СТАТИСТИКА ───────────────
+
+def create_payment_request(uid, uname, fname, plan, mode="extend"):
     def op(conn):
-        cur = conn.execute("INSERT INTO payment_requests (user_id, username, full_name, plan, created_at) VALUES (?, ?, ?, ?, ?)", (uid, uname, fname, plan, datetime.now().isoformat()))
+        cur = conn.execute("INSERT INTO payment_requests (user_id, username, full_name, plan, mode, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+                           (uid, uname, fname, plan, mode, datetime.now().isoformat()))
         return cur.lastrowid
     return _db_retry(op)
 
@@ -326,7 +566,8 @@ def user_has_pending_request(uid):
 
 def create_promo(code, plan, uses):
     try:
-        _db_retry(lambda conn: conn.execute("INSERT INTO promocodes (code, plan, uses_left, created_at) VALUES (?, ?, ?, ?)", (code, plan, uses, datetime.now().isoformat())))
+        _db_retry(lambda conn: conn.execute("INSERT INTO promocodes (code, plan, uses_left, created_at) VALUES (?, ?, ?, ?)",
+                                            (code, plan, uses, datetime.now().isoformat())))
         return True
     except sqlite3.IntegrityError:
         return False
@@ -346,6 +587,8 @@ def use_promo(uid, code):
         p = c.execute("SELECT id, plan, uses_left FROM promocodes WHERE code = ?", (code,)).fetchone()
         if not p or p[2] <= 0:
             return False, "❌ Промокод не найден или закончился."
+        if p[1] not in PLANS:
+            return False, "❌ Промокод повреждён (неизвестный тариф)."
         if c.execute("SELECT 1 FROM used_promos WHERE user_id = ? AND promo_id = ?", (uid, p[0])).fetchone():
             return False, "⚠️ Ты уже использовал этот промокод."
         c.execute("UPDATE promocodes SET uses_left = uses_left - 1 WHERE id = ? AND uses_left > 0", (p[0],))
@@ -355,18 +598,23 @@ def use_promo(uid, code):
         return True, p[1]
     ok, value = _db_retry(op)
     if ok:
-        create_slot(uid, value)
+        add_subscription(uid, value)
     return ok, value
 
 
 def get_stats():
+    now_iso = datetime.now().isoformat()
+    soon_iso = (datetime.now() + timedelta(days=NOTIFY_BEFORE_DAYS)).isoformat()
+
     def read(conn):
         c = conn.cursor()
         return {
             "users": c.execute("SELECT COUNT(*) FROM users").fetchone()[0],
             "banned": c.execute("SELECT COUNT(*) FROM users WHERE is_banned = 1").fetchone()[0],
             "admins": c.execute("SELECT COUNT(*) FROM users WHERE is_admin = 1").fetchone()[0],
-            "slots": c.execute("SELECT COUNT(*) FROM slots WHERE expires_at > ?", (datetime.now().isoformat(),)).fetchone()[0],
+            "slots": c.execute("SELECT COUNT(*) FROM subscriptions WHERE kind='bot' AND expires_at > ?", (now_iso,)).fetchone()[0],
+            "hosts": c.execute("SELECT COUNT(*) FROM subscriptions WHERE kind='host' AND expires_at > ?", (now_iso,)).fetchone()[0],
+            "soon": c.execute("SELECT COUNT(*) FROM subscriptions WHERE expires_at > ? AND expires_at < ?", (now_iso, soon_iso)).fetchone()[0],
             "bots": c.execute("SELECT COUNT(*) FROM bots").fetchone()[0],
             "frozen": c.execute("SELECT COUNT(*) FROM bots WHERE is_frozen = 1").fetchone()[0],
             "pending": c.execute("SELECT COUNT(*) FROM payment_requests WHERE status = 'pending'").fetchone()[0],
@@ -374,21 +622,30 @@ def get_stats():
         }
     return _db_read(read)
 
+
+# ═══════════════════════════════════════════════════════════════
 # 🛡 ГЛОБАЛЬНЫЙ БАН
 # ═══════════════════════════════════════════════════════════════
+
 class BanMiddleware(BaseMiddleware):
     async def __call__(self, handler, event, data):
         u = data.get("event_from_user")
         if u and is_user_banned(u.id):
-            if isinstance(event, types.Message): await event.answer("🚫 <b>Вы заблокированы на хостинге.</b>", parse_mode="HTML")
-            elif isinstance(event, types.CallbackQuery): await event.answer("🚫 Вы заблокированы", show_alert=True)
+            if isinstance(event, types.Message):
+                await event.answer("🚫 <b>Вы заблокированы на хостинге.</b>", parse_mode="HTML")
+            elif isinstance(event, types.CallbackQuery):
+                await event.answer("🚫 Вы заблокированы", show_alert=True)
             return
         return await handler(event, data)
-dp.message.middleware(BanMiddleware()); dp.callback_query.middleware(BanMiddleware())
+
+
+dp.message.middleware(BanMiddleware())
+dp.callback_query.middleware(BanMiddleware())
 
 # ═══════════════════════════════════════════════════════════════
 # 🚀 ОБЁРТКА И ЗАПУСК
 # ═══════════════════════════════════════════════════════════════
+
 WRAPPER_CODE = r'''#!/usr/bin/env python3
 import os, sys, subprocess, time, signal, hashlib, re, venv, json
 ENTRY_POINT = "{{ENTRY_POINT}}"
@@ -473,139 +730,188 @@ while attempt<4:
 sys.exit(ret)
 '''
 
-def write_wrapper(bot_dir, entry_point): (bot_dir / "wrapper.py").write_text(WRAPPER_CODE.replace("{{ENTRY_POINT}}", entry_point), encoding="utf-8")
+
+def write_wrapper(bot_dir, entry_point):
+    (bot_dir / "wrapper.py").write_text(WRAPPER_CODE.replace("{{ENTRY_POINT}}", entry_point), encoding="utf-8")
+
 
 async def archive_bot_files(bot_id: int):
     """Сохраняет актуальные файлы бота в Telegram Storage Channel."""
     if not FILE_STORAGE_CHANNEL_ID:
         logger.warning("BOT_FILES_STORAGE_CHANNEL_ID/STORAGE_CHANNEL_ID не задан — архив #%s только локальный", bot_id)
         return False
-    bot_dir=BOTS_DIR/f"bot_{bot_id}"
-    if not bot_dir.exists(): return False
-    tmp=DATA_DIR/f"bot_{bot_id}_{int(time.time())}.zip"
+    bot_dir = BOTS_DIR / f"bot_{bot_id}"
+    if not bot_dir.exists():
+        return False
+    tmp = DATA_DIR / f"bot_{bot_id}_{int(time.time())}.zip"
     try:
-        with zipfile.ZipFile(tmp,"w",zipfile.ZIP_DEFLATED) as z:
-            for root,dirs,files in os.walk(bot_dir):
-                dirs[:]=[d for d in dirs if d not in {"__pycache__",".venv",".git"}]
+        with zipfile.ZipFile(tmp, "w", zipfile.ZIP_DEFLATED) as z:
+            for root, dirs, files in os.walk(bot_dir):
+                dirs[:] = [d for d in dirs if d not in {"__pycache__", ".venv", ".git"}]
                 for name in files:
-                    if name in {"wrapper.py","bot.log",".requirements.installed"}: continue
-                    fp=Path(root)/name
-                    z.write(fp,fp.relative_to(bot_dir).as_posix())
-        if tmp.stat().st_size > 49*1024*1024:
-            logger.error("Архив бота #%s слишком большой для Telegram: %s bytes",bot_id,tmp.stat().st_size)
+                    if name in {"wrapper.py", "bot.log", ".requirements.installed"}:
+                        continue
+                    fp = Path(root) / name
+                    z.write(fp, fp.relative_to(bot_dir).as_posix())
+        if tmp.stat().st_size > 49 * 1024 * 1024:
+            logger.error("Архив бота #%s слишком большой для Telegram: %s bytes", bot_id, tmp.stat().st_size)
             return False
-        b=get_bot(bot_id)
-        ep=(b[7] if b and len(b)>7 else "") or find_entry_point(bot_dir)
-        msg=await bot.send_document(FILE_STORAGE_CHANNEL_ID,FSInputFile(str(tmp)),caption=(
+        b = get_bot(bot_id)
+        ep = (b[7] if b and len(b) > 7 else "") or find_entry_point(bot_dir)
+        msg = await bot.send_document(FILE_STORAGE_CHANNEL_ID, FSInputFile(str(tmp)), caption=(
             f"🤖 <b>BotHost FILE BACKUP</b>\n"
             f"BOT_ID=<code>{bot_id}</code>\n"
             f"OWNER_ID=<code>{b[1] if b else 0}</code>\n"
             f"ENTRY_POINT=<code>{html.escape(ep)}</code>\n"
             f"DATE=<code>{datetime.now().isoformat()}</code>"
-        ),parse_mode="HTML")
-        _db_retry(lambda conn: conn.execute("INSERT INTO bot_archives(bot_id,message_id,file_id,filename,created_at) VALUES(?,?,?,?,?)",(bot_id,msg.message_id,msg.document.file_id,tmp.name,datetime.now().isoformat())))
-        logger.info("📦 Файлы бота #%s сохранены в Storage Channel (message_id=%s)",bot_id,msg.message_id)
+        ), parse_mode="HTML")
+        _db_retry(lambda conn: conn.execute(
+            "INSERT INTO bot_archives(bot_id,message_id,file_id,filename,created_at) VALUES(?,?,?,?,?)",
+            (bot_id, msg.message_id, msg.document.file_id, tmp.name, datetime.now().isoformat())))
+        logger.info("📦 Файлы бота #%s сохранены в Storage Channel (message_id=%s)", bot_id, msg.message_id)
         return True
     except Exception as e:
-        logger.exception("Не удалось сохранить файлы бота #%s: %s",bot_id,e)
+        logger.exception("Не удалось сохранить файлы бота #%s: %s", bot_id, e)
         return False
     finally:
-        try: tmp.unlink()
-        except FileNotFoundError: pass
+        try:
+            tmp.unlink()
+        except FileNotFoundError:
+            pass
+
 
 async def restore_bot_files(bot_id: int):
     """Восстанавливает последнюю архивную версию файлов из Telegram."""
-    bot_dir=BOTS_DIR/f"bot_{bot_id}"
-    archives=_db_read(lambda conn: conn.execute("SELECT file_id FROM bot_archives WHERE bot_id=? ORDER BY id DESC LIMIT 1",(bot_id,)).fetchone())
-    if not archives: return False
-    file_id=archives[0]
-    tmp=DATA_DIR/f"restore_bot_{bot_id}_{uuid.uuid4().hex}.zip"
+    bot_dir = BOTS_DIR / f"bot_{bot_id}"
+    archives = _db_read(lambda conn: conn.execute("SELECT file_id FROM bot_archives WHERE bot_id=? ORDER BY id DESC LIMIT 1", (bot_id,)).fetchone())
+    if not archives:
+        return False
+    file_id = archives[0]
+    tmp = DATA_DIR / f"restore_bot_{bot_id}_{uuid.uuid4().hex}.zip"
     try:
-        info=await bot.get_file(file_id)
-        await bot.download_file(info.file_path,destination=tmp)
-        bot_dir.mkdir(parents=True,exist_ok=True)
+        info = await bot.get_file(file_id)
+        await bot.download_file(info.file_path, destination=tmp)
+        bot_dir.mkdir(parents=True, exist_ok=True)
         for child in list(bot_dir.iterdir()):
-            if child.name in {"bot.log"}: continue
-            if child.is_dir(): shutil.rmtree(child,ignore_errors=True)
+            if child.name in {"bot.log"}:
+                continue
+            if child.is_dir():
+                shutil.rmtree(child, ignore_errors=True)
             else:
-                try: child.unlink()
-                except Exception: pass
-        with zipfile.ZipFile(tmp,"r") as z: safe_extract_zip(z,bot_dir)
-        ep=find_entry_point(bot_dir)
-        if ep: update_bot_entry(bot_id,ep)
-        logger.info("♻️ Файлы бота #%s восстановлены из Telegram Storage",bot_id)
+                try:
+                    child.unlink()
+                except Exception:
+                    pass
+        with zipfile.ZipFile(tmp, "r") as z:
+            safe_extract_zip(z, bot_dir)
+        ep = find_entry_point(bot_dir)
+        if ep:
+            update_bot_entry(bot_id, ep)
+        logger.info("♻️ Файлы бота #%s восстановлены из Telegram Storage", bot_id)
         return True
     except Exception as e:
-        logger.warning("Не удалось восстановить файлы бота #%s: %s",bot_id,e)
+        logger.warning("Не удалось восстановить файлы бота #%s: %s", bot_id, e)
         return False
     finally:
-        try: tmp.unlink()
-        except FileNotFoundError: pass
+        try:
+            tmp.unlink()
+        except FileNotFoundError:
+            pass
+
 
 async def start_user_bot(bot_id):
-    lock=start_locks.setdefault(bot_id,asyncio.Lock())
+    lock = start_locks.setdefault(bot_id, asyncio.Lock())
     async with lock:
         try:
-            b=get_bot(bot_id)
-            if not b or b[6]==1: return False
-            current=running_bots.get(bot_id)
-            if current and current.poll() is None: return True
-            bot_dir=BOTS_DIR/f"bot_{bot_id}"; bot_dir.mkdir(parents=True,exist_ok=True)
-            ep=resolve_entry_point(bot_id, bot_dir, b[7] if len(b)>7 else "")
+            b = get_bot(bot_id)
+            if not b or b[6] == 1:
+                return False
+            current = running_bots.get(bot_id)
+            if current and current.poll() is None:
+                return True
+            bot_dir = BOTS_DIR / f"bot_{bot_id}"
+            bot_dir.mkdir(parents=True, exist_ok=True)
+            ep = resolve_entry_point(bot_id, bot_dir, b[7] if len(b) > 7 else "")
             if not ep:
                 logger.error("У бота #%s нет .py файла для запуска", bot_id)
                 _db_retry(lambda conn: conn.execute("UPDATE bots SET status='error' WHERE id=?", (bot_id,)))
                 return False
-            write_wrapper(bot_dir,ep)
-            log_file=bot_dir/"bot.log"
-            with open(log_file,"a",encoding="utf-8") as f: f.write(f"\n[{datetime.now().strftime('%d.%m %H:%M:%S')}] === ЗАПУСК БОТА #{bot_id} ===\n")
-            env=os.environ.copy()
+            write_wrapper(bot_dir, ep)
+            log_file = bot_dir / "bot.log"
+            with open(log_file, "a", encoding="utf-8") as f:
+                f.write(f"\n[{datetime.now().strftime('%d.%m %H:%M:%S')}] === ЗАПУСК БОТА #{bot_id} ===\n")
+            env = os.environ.copy()
             for key in list(env):
-                if key.startswith("RAILWAY_") or key in {"BOT_TOKEN","CASHIER_TOKEN","GROQ_API_KEY","SYNC_CHANNEL_ID","SYNC_SECRET","OWNER_ID","OWNER_USERNAME","VERIFIER_BOT","DATABASE_URL","DATA_DIR","BOTHOST_USER_ENV","BOTHOST_BOT_TOKEN"}: env.pop(key,None)
-            user_env=get_bot_env(bot_id); env.update({str(k):str(v) for k,v in user_env.items() if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*",str(k))})
-            if b[3]: env["BOTHOST_BOT_TOKEN"]=b[3]
-            env["BOTHOST_USER_ENV"]=json.dumps(user_env,ensure_ascii=False); env["PYTHONUNBUFFERED"]="1"
-            lf=open(log_file,"a",encoding="utf-8")
-            proc=subprocess.Popen([sys.executable,"-u","wrapper.py"],cwd=str(bot_dir),env=env,stdout=lf,stderr=subprocess.STDOUT,start_new_session=True)
-            running_bots[bot_id]=proc; await asyncio.sleep(4)
+                if key.startswith("RAILWAY_") or key in {"BOT_TOKEN", "CASHIER_TOKEN", "GROQ_API_KEY", "SYNC_CHANNEL_ID", "SYNC_SECRET",
+                                                         "OWNER_ID", "OWNER_USERNAME", "VERIFIER_BOT", "DATABASE_URL", "DATA_DIR",
+                                                         "BOTHOST_USER_ENV", "BOTHOST_BOT_TOKEN"}:
+                    env.pop(key, None)
+            user_env = get_bot_env(bot_id)
+            env.update({str(k): str(v) for k, v in user_env.items() if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", str(k))})
+            if b[3]:
+                env["BOTHOST_BOT_TOKEN"] = b[3]
+            env["BOTHOST_USER_ENV"] = json.dumps(user_env, ensure_ascii=False)
+            env["PYTHONUNBUFFERED"] = "1"
+            lf = open(log_file, "a", encoding="utf-8")
+            proc = subprocess.Popen([sys.executable, "-u", "wrapper.py"], cwd=str(bot_dir), env=env,
+                                    stdout=lf, stderr=subprocess.STDOUT, start_new_session=True)
+            running_bots[bot_id] = proc
+            await asyncio.sleep(4)
             if proc.poll() is not None:
-                if running_bots.get(bot_id) is proc: running_bots.pop(bot_id,None)
-                _db_retry(lambda conn: conn.execute("UPDATE bots SET status='error' WHERE id=?",(bot_id,)))
+                if running_bots.get(bot_id) is proc:
+                    running_bots.pop(bot_id, None)
+                _db_retry(lambda conn: conn.execute("UPDATE bots SET status='error' WHERE id=?", (bot_id,)))
                 return False
-            _db_retry(lambda conn: conn.execute("UPDATE bots SET status='running' WHERE id=?",(bot_id,)))
+            _db_retry(lambda conn: conn.execute("UPDATE bots SET status='running' WHERE id=?", (bot_id,)))
             return True
         except Exception as e:
-            logger.exception("Не удалось запустить бот #%s: %s",bot_id,e); return False
+            logger.exception("Не удалось запустить бот #%s: %s", bot_id, e)
+            return False
+
 
 async def stop_user_bot(bot_id):
-    lock=start_locks.setdefault(bot_id,asyncio.Lock())
+    lock = start_locks.setdefault(bot_id, asyncio.Lock())
     async with lock:
-        proc=running_bots.pop(bot_id,None)
+        proc = running_bots.pop(bot_id, None)
         if proc:
-            try: os.killpg(os.getpgid(proc.pid),signal.SIGTERM); proc.wait(timeout=3)
+            try:
+                os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+                proc.wait(timeout=3)
             except Exception:
-                try: os.killpg(os.getpgid(proc.pid),signal.SIGKILL)
-                except Exception: pass
-        try: _db_retry(lambda conn: conn.execute("UPDATE bots SET status='stopped' WHERE id=?",(bot_id,)))
-        except Exception as e: logger.warning("Не удалось обновить статус бота #%s: %s",bot_id,e)
+                try:
+                    os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+                except Exception:
+                    pass
+        try:
+            _db_retry(lambda conn: conn.execute("UPDATE bots SET status='stopped' WHERE id=?", (bot_id,)))
+        except Exception as e:
+            logger.warning("Не удалось обновить статус бота #%s: %s", bot_id, e)
 
 
 def get_bot_logs(bot_id, lines=50):
     lf = BOTS_DIR / f"bot_{bot_id}" / "bot.log"
-    if not lf.exists(): return ""
-    try: content = lf.read_text(encoding="utf-8", errors="ignore").strip(); return "\n".join(content.split("\n")[-lines:]) if content else ""
-    except Exception as e: return f"Ошибка чтения логов: {e}"
+    if not lf.exists():
+        return ""
+    try:
+        content = lf.read_text(encoding="utf-8", errors="ignore").strip()
+        return "\n".join(content.split("\n")[-lines:]) if content else ""
+    except Exception as e:
+        return f"Ошибка чтения логов: {e}"
+
 
 def list_bot_files(bot_id):
     bot_dir = BOTS_DIR / f"bot_{bot_id}"
-    if not bot_dir.exists(): return []
+    if not bot_dir.exists():
+        return []
     files = []
     for root, dirs, fs in os.walk(bot_dir):
         dirs[:] = [d for d in dirs if d not in {".venv", "__pycache__", ".git"}]
         for f in fs:
-            if f in ("wrapper.py", "bot.log", ".requirements.installed"): continue
-            files.append((str(Path(root) / f).replace(str(bot_dir)+"/", ""), (Path(root) / f).stat().st_size))
+            if f in ("wrapper.py", "bot.log", ".requirements.installed"):
+                continue
+            files.append((str(Path(root) / f).replace(str(bot_dir) + "/", ""), (Path(root) / f).stat().st_size))
     return files
+
 
 async def monitor_bots():
     while True:
@@ -613,66 +919,174 @@ async def monitor_bots():
             for bot_id, proc in list(running_bots.items()):
                 if proc.poll() is not None:
                     code = proc.returncode
-                    if running_bots.get(bot_id) is proc: running_bots.pop(bot_id,None)
-                    conn = get_db(); c = conn.cursor()
+                    if running_bots.get(bot_id) is proc:
+                        running_bots.pop(bot_id, None)
+                    conn = get_db()
+                    c = conn.cursor()
                     c.execute("UPDATE bots SET status = 'error' WHERE id = ?", (bot_id,))
                     c.execute("SELECT user_id, auto_restart FROM bots WHERE id = ?", (bot_id,))
-                    row = c.fetchone(); conn.commit(); conn.close()
+                    row = c.fetchone()
+                    conn.commit()
+                    conn.close()
                     if row:
                         uid, auto_restart = row
                         if auto_restart == 1 and not is_user_banned(uid):
-                            try: await bot.send_message(uid, f"⚠️ <b>Бот #{bot_id} упал!</b>\n🔄 <i>Авто-рестарт включён, пытаюсь поднять...</i>", parse_mode="HTML")
-                            except: pass
-                            await asyncio.sleep(5); await start_user_bot(bot_id)
+                            try:
+                                await bot.send_message(uid, f"⚠️ <b>Бот #{bot_id} упал!</b>\n🔄 <i>Авто-рестарт включён, пытаюсь поднять...</i>", parse_mode="HTML")
+                            except Exception:
+                                pass
+                            await asyncio.sleep(5)
+                            await start_user_bot(bot_id)
                         else:
                             if uid != OWNER_ID:
                                 logs = get_bot_logs(bot_id, 15)
-                                try: await bot.send_message(uid, f"⚠️ <b>Бот #{bot_id} упал!</b>\nКод: {code}\n<pre>{html.escape(logs[-500:])}</pre>", parse_mode="HTML")
-                                except: pass
+                                try:
+                                    await bot.send_message(uid, f"⚠️ <b>Бот #{bot_id} упал!</b>\nКод: {code}\n<pre>{html.escape(logs[-500:])}</pre>", parse_mode="HTML")
+                                except Exception:
+                                    pass
                 else:
                     b = get_bot(bot_id)
                     if b and (b[6] == 1 or is_user_banned(b[1]) or (b[1] != OWNER_ID and not is_admin(b[1]) and not has_active_slot(b[1]))):
                         await stop_user_bot(bot_id)
-        except: pass
+                        if b[1] != OWNER_ID and not is_admin(b[1]):
+                            try:
+                                await bot.send_message(
+                                    b[1],
+                                    f"⏸ <b>Бот #{bot_id} остановлен</b>\n\n"
+                                    "📦 Подписка истекла (льготные 24 ч закончились).\n"
+                                    "Продли — и бот снова поднимется с теми же файлами.",
+                                    reply_markup=renew_kb("bot"),
+                                    parse_mode="HTML"
+                                )
+                            except Exception:
+                                pass
+        except Exception:
+            logger.exception("monitor_bots error")
         await asyncio.sleep(20)
 
+
+async def monitor_subscriptions():
+    """Напоминания: за 3 дня, за 1 день и после истечения — с выбором тарифа продления."""
+    await asyncio.sleep(15)
+    while True:
+        try:
+            border = (datetime.now() - timedelta(days=7)).isoformat()
+            rows = _db_read(lambda conn: conn.execute(
+                f"SELECT {SUB_COLS} FROM subscriptions WHERE expires_at > ? AND (reminded_3d=0 OR reminded_1d=0 OR expired_notified=0) ORDER BY expires_at ASC",
+                (border,)).fetchall())
+            now = datetime.now()
+            for s in rows:
+                sub_id, uid, kind, pid, expires_at, _period, r3, r1, expn, _created = s
+                if is_user_banned(uid):
+                    continue
+                p = PLANS.get(pid, {})
+                exp = datetime.fromisoformat(expires_at)
+                left = (exp - now).total_seconds()
+                kind_info = KINDS.get(kind, KINDS["bot"])
+
+                if left <= 0:
+                    if expn:
+                        continue
+                    text = (
+                        "🔴 <b>Подписка истекла</b>\n\n"
+                        f"{kind_info['emoji']} <b>{kind_info['name']}</b> · {p.get('name', pid)}\n"
+                        f"Истекла: <b>{fmt_dt(exp)}</b>\n\n"
+                        f"⏳ Боты работают ещё <b>{GRACE_HOURS} ч</b> (льготный период), потом остановятся.\n"
+                        "Файлы и настройки сохранятся — просто продли."
+                    )
+                    _db_retry(lambda conn, i=sub_id: conn.execute("UPDATE subscriptions SET expired_notified=1, reminded_3d=1, reminded_1d=1 WHERE id=?", (i,)))
+                    try:
+                        await bot.send_message(uid, text, reply_markup=renew_kb(kind), parse_mode="HTML")
+                    except Exception as e:
+                        logger.warning("Не удалось отправить уведомление об истечении %s: %s", uid, e)
+                    continue
+
+                if left <= 86400 and not r1:
+                    text = (
+                        "⏰ <b>Осталось меньше суток!</b>\n\n"
+                        f"{kind_info['emoji']} <b>{kind_info['name']}</b> · {p.get('name', pid)}\n"
+                        f"Осталось: <b>{human_left(expires_at)}</b> (до {fmt_dt(exp)})\n\n"
+                        "Продли сейчас, чтобы боты не останавливались."
+                    )
+                    _db_retry(lambda conn, i=sub_id: conn.execute("UPDATE subscriptions SET reminded_1d=1, reminded_3d=1 WHERE id=?", (i,)))
+                    try:
+                        await bot.send_message(uid, text, reply_markup=renew_kb(kind), parse_mode="HTML")
+                    except Exception as e:
+                        logger.warning("Не удалось отправить напоминание %s: %s", uid, e)
+                    continue
+
+                if left <= NOTIFY_BEFORE_DAYS * 86400 and not r3:
+                    text = (
+                        "🔔 <b>Подписка скоро закончится</b>\n\n"
+                        f"{kind_info['emoji']} <b>{kind_info['name']}</b> · {p.get('name', pid)}\n"
+                        f"Осталось: <b>{human_left(expires_at)}</b> (до {fmt_dt(exp)})\n\n"
+                        "♻️ Продление стакается: новые дни прибавятся к текущей дате, остаток не сгорит."
+                    )
+                    _db_retry(lambda conn, i=sub_id: conn.execute("UPDATE subscriptions SET reminded_3d=1 WHERE id=?", (i,)))
+                    try:
+                        await bot.send_message(uid, text, reply_markup=renew_kb(kind), parse_mode="HTML")
+                    except Exception as e:
+                        logger.warning("Не удалось отправить напоминание %s: %s", uid, e)
+        except Exception:
+            logger.exception("monitor_subscriptions error")
+        await asyncio.sleep(SUB_CHECK_INTERVAL)
+
+
 async def bootstrap_bot_archives():
-    """После обновления BotHost один раз создаёт архивы для старых локальных ботов, у которых ещё нет копии."""
+    """После обновления BotHost один раз создаёт архивы для старых локальных ботов."""
     for b in get_all_bots():
-        exists=_db_read(lambda conn,bid=b[0]: conn.execute("SELECT 1 FROM bot_archives WHERE bot_id=? LIMIT 1",(bid,)).fetchone())
-        if not exists and get_python_files(BOTS_DIR/f"bot_{b[0]}"):
+        exists = _db_read(lambda conn, bid=b[0]: conn.execute("SELECT 1 FROM bot_archives WHERE bot_id=? LIMIT 1", (bid,)).fetchone())
+        if not exists and get_python_files(BOTS_DIR / f"bot_{b[0]}"):
             await archive_bot_files(b[0])
 
+
 async def restore_running_bots():
-    conn = get_db(); c = conn.cursor(); c.execute("SELECT id, user_id, is_frozen FROM bots WHERE status = 'running'"); bots = c.fetchall(); conn.close()
+    conn = get_db()
+    c = conn.cursor()
+    c.execute("SELECT id, user_id, is_frozen FROM bots WHERE status = 'running'")
+    bots = c.fetchall()
+    conn.close()
     for bid, uid, frozen in bots:
-        bot_dir=BOTS_DIR/f"bot_{bid}"
+        bot_dir = BOTS_DIR / f"bot_{bid}"
         if not get_python_files(bot_dir):
             await restore_bot_files(bid)
-        if not frozen and not is_user_banned(uid) and (uid == OWNER_ID or is_admin(uid) or has_active_slot(uid)):
+        if not frozen and not is_user_banned(uid) and has_active_slot(uid):
             await start_user_bot(bid)
+
 
 async def auto_backup():
     while True:
         await asyncio.sleep(24 * 3600)
         try:
             if os.path.exists(DB_PATH):
-                await bot.send_document(OWNER_ID, FSInputFile(DB_PATH, filename=f"bothost_backup_{datetime.now().strftime('%Y%m%d')}.db"), caption="🔄 Автоматический бэкап базы данных.")
+                await bot.send_document(OWNER_ID, FSInputFile(DB_PATH, filename=f"bothost_backup_{datetime.now().strftime('%Y%m%d')}.db"),
+                                        caption="🔄 Автоматический бэкап базы данных.")
             for b in get_all_bots():
                 await archive_bot_files(b[0])
+            removed = cleanup_subscriptions(60)
+            if removed:
+                logger.info("🧹 Удалено старых подписок: %s", removed)
         except Exception:
             logger.exception("auto backup error")
 
+
 async def analyze_with_groq(logs):
-    if not groq_client: return "❌ **AI-дебаггер недоступен.**\nОтсутствует ключ `GROQ_API_KEY`."
-    if not logs.strip(): return "📭 Логи пустые, нечего анализировать."
+    if not groq_client:
+        return "❌ **AI-дебаггер недоступен.**\nОтсутствует ключ `GROQ_API_KEY`."
+    if not logs.strip():
+        return "📭 Логи пустые, нечего анализировать."
     try:
         response = await groq_client.chat.completions.create(
-            messages=[{"role": "system", "content": "Ты опытный Python разработчик BotHost. Найди ошибку в логах. Отвечай кратко на русском в HTML: <b>❓ Проблема:</b> ... <b>📍 Где:</b> ... <b>💡 Решение:</b> ..."}, {"role": "user", "content": f"Лог:\n\n{logs[-2500:]}"}],
+            messages=[{"role": "system", "content": "Ты опытный Python разработчик BotHost. Найди ошибку в логах. Отвечай кратко на русском в HTML: <b>❓ Проблема:</b> ... <b>📍 Где:</b> ... <b>💡 Решение:</b> ..."},
+                      {"role": "user", "content": f"Лог:\n\n{logs[-2500:]}"}],
             model="qwen/qwen3.8-27b", temperature=0.2, max_completion_tokens=350, reasoning_effort="none"
         )
         return response.choices[0].message.content
-    except Exception as e: return f"❌ Ошибка нейросети: {e}" # ═══════════════════════════════════════════════════════════════
+    except Exception as e:
+        return f"❌ Ошибка нейросети: {e}"
+
+
+# ═══════════════════════════════════════════════════════════════
 # 📝 FSM
 # ═══════════════════════════════════════════════════════════════
 
@@ -680,14 +1094,18 @@ class UploadStates(StatesGroup):
     waiting_file = State()
     waiting_token = State()
 
+
 class AddFileStates(StatesGroup):
     waiting_file = State()
+
 
 class EnvStates(StatesGroup):
     waiting_env_text = State()
 
+
 class UserStates(StatesGroup):
     enter_promo = State()
+
 
 class AdminStates(StatesGroup):
     broadcast = State()
@@ -698,17 +1116,21 @@ class AdminStates(StatesGroup):
     ban = State()
     unban = State()
     promo_code = State()
+    promo_plan = State()
     promo_uses = State()
     search_bot = State()
+    grant_uid = State()
+    grant_plan = State()
+
 
 # ═══════════════════════════════════════════════════════════════
 # 📱 КНОПКИ
 # ═══════════════════════════════════════════════════════════════
 
-
 # Один polling-процесс на один сервер/контейнер.
 INSTANCE_LOCK = DATA_DIR / "bothost.polling.lock"
 _instance_lock_handle = None
+
 
 def acquire_instance_lock():
     global _instance_lock_handle
@@ -726,21 +1148,10 @@ def acquire_instance_lock():
     except Exception as e:
         logger.warning("Не удалось создать локальный lock: %s", e)
 
+
 def get_profile_link():
     return f"https://t.me/{OWNER_USERNAME}" if OWNER_USERNAME else f"tg://user?id={OWNER_ID}"
 
-def main_menu_kb(uid):
-    buttons = [
-        [InlineKeyboardButton(text="💳 Тарифы", callback_data="buy"),
-         InlineKeyboardButton(text="🎁 Промокод", callback_data="promo_enter")],
-        [InlineKeyboardButton(text="➕ Новый бот", callback_data="upload")],
-        [InlineKeyboardButton(text="🤖 Мои проекты", callback_data="mybots"),
-         InlineKeyboardButton(text="📦 Моя подписка", callback_data="myslots")],
-        [InlineKeyboardButton(text="ℹ️ Как это работает", callback_data="help")]
-    ]
-    if is_admin(uid):
-        buttons.append([InlineKeyboardButton(text="🛠 Администрирование", callback_data="admin")])
-    return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 def get_uptime():
     sec = int(time.time() - BOT_START_TIME)
@@ -749,51 +1160,110 @@ def get_uptime():
     m, _ = divmod(r, 60)
     return f"{d}д {h}ч {m}м"
 
+
+def plans_of_kind(kind):
+    return [(pid, p) for pid, p in PLANS.items() if p["kind"] == kind]
+
+
+def tariffs_kb(kind):
+    rows = [[InlineKeyboardButton(text=f"{p['emoji']} {p['name']} — {p['stars']}⭐ / {p['days']} дн.", callback_data=f"plan:{pid}")]
+            for pid, p in plans_of_kind(kind)]
+    rows.append([InlineKeyboardButton(text="« Тарифы", callback_data="buy")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def renew_kb(kind):
+    """Клавиатура продления для уведомлений и для остановленных ботов."""
+    rows = [[InlineKeyboardButton(text=f"{p['emoji']} {p['name']} · {p['stars']}⭐", callback_data=f"plan:{pid}:extend")]
+            for pid, p in plans_of_kind(kind)]
+    if kind == "bot" and plans_of_kind("host"):
+        rows.append([InlineKeyboardButton(text="🚀 Хостинг без лимита — ботов сколько угодно", callback_data="buykind:host")])
+    rows.append([InlineKeyboardButton(text="📦 Моя подписка", callback_data="myslots")])
+    rows.append([InlineKeyboardButton(text="« Главное меню", callback_data="back_main")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def main_menu_kb(uid):
+    buttons = []
+    lim = get_limits(uid)
+    until = lim.get("until")
+    urgent = False
+    if until:
+        left = (datetime.fromisoformat(until) - datetime.now()).total_seconds()
+        urgent = left <= NOTIFY_BEFORE_DAYS * 86400
+    elif not lim["unlimited"] and not is_admin(uid):
+        urgent = True
+    if urgent:
+        buttons.append([InlineKeyboardButton(text="⚠️ Продлить подписку", callback_data="myslots")])
+    buttons += [
+        [InlineKeyboardButton(text="💳 Тарифы", callback_data="buy"),
+         InlineKeyboardButton(text="🎁 Промокод", callback_data="promo_enter")],
+        [InlineKeyboardButton(text="➕ Новый бот", callback_data="upload")],
+        [InlineKeyboardButton(text="🤖 Мои проекты", callback_data="mybots"),
+         InlineKeyboardButton(text="📦 Моя подписка", callback_data="myslots")],
+        [InlineKeyboardButton(text="ℹ️ Как это работает", callback_data="help")],
+    ]
+    if is_admin(uid):
+        buttons.append([InlineKeyboardButton(text="🛠 Администрирование", callback_data="admin")])
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
 # ═══════════════════════════════════════════════════════════════
 # 🔗 СВЯЗЬ С ИИ-КАССИРОМ ЧЕРЕЗ КАНАЛ
 # Кассир пишет в канал: /auto_grant USER_ID PLAN GRANT_ID SIGNATURE
-# Хост проверяет подпись и выдаёт слот
 # ═══════════════════════════════════════════════════════════════
 
 @dp.channel_post(F.text.startswith("/payment_request"))
 async def channel_payment_request(message: types.Message):
     try:
-        parts=message.text.strip().split()
-        if len(parts)<5 or not SYNC_SECRET: return
-        uid=int(parts[1]); plan=parts[2]; username=parts[3]; sig=parts[4]
-        expected=hmac.new(SYNC_SECRET.encode(),f"request:{uid}:{plan}:{username}".encode(),hashlib.sha256).hexdigest()
-        if not hmac.compare_digest(sig,expected) or plan not in PLANS: return
+        parts = message.text.strip().split()
+        if len(parts) < 5 or not SYNC_SECRET:
+            return
+        uid = int(parts[1])
+        plan = parts[2]
+        username = parts[3]
+        sig = parts[4]
+        expected = hmac.new(SYNC_SECRET.encode(), f"request:{uid}:{plan}:{username}".encode(), hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(sig, expected) or plan not in PLANS:
+            return
         create_user(uid, username, "")
         if not user_has_pending_request(uid):
             create_payment_request(uid, username, "", plan)
-        logger.info("Payment request received from cashier: user=%s plan=%s", uid, plan)
-    except Exception: pass
+        logger.info("Payment request from cashier: user=%s plan=%s", uid, plan)
+    except Exception:
+        pass
+
 
 @dp.channel_post(F.text.startswith("/payment_result"))
 async def channel_payment_result(message: types.Message):
     try:
-        parts=message.text.strip().split()
-        if len(parts)<6 or not SYNC_SECRET: return
-        uid=int(parts[1]); plan=parts[2]; result=parts[3].upper(); grant_id=parts[4]; sig=parts[5]
-        expected=hmac.new(SYNC_SECRET.encode(),f"result:{uid}:{plan}:{result}:{grant_id}".encode(),hashlib.sha256).hexdigest()
-        if not hmac.compare_digest(sig,expected) or plan not in PLANS: return
-        if result=="APPROVED":
-            def grant(conn):
-                if conn.execute("SELECT 1 FROM auto_grants WHERE grant_id=?",(grant_id,)).fetchone(): return False
-                conn.execute("INSERT INTO auto_grants(grant_id,user_id,plan,created_at) VALUES(?,?,?,?)",(grant_id,uid,plan,datetime.now().isoformat()))
-                conn.execute("INSERT INTO users(user_id,username,full_name,created_at) VALUES(?,'','',?) ON CONFLICT(user_id) DO NOTHING",(uid,datetime.now().isoformat()))
-                exp=datetime.now()+timedelta(days=PLANS[plan]["days"]); conn.execute("INSERT INTO slots(user_id,plan,expires_at,created_at) VALUES(?,?,?,?)",(uid,plan,exp.isoformat(),datetime.now().isoformat())); return True
-            if _db_retry(grant):
-                try: await bot.send_message(uid,"🎉 <b>Оплата подтверждена!</b>\nСлот активирован.",reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="➕ Новый бот",callback_data="upload")],[InlineKeyboardButton(text="🤖 Мои проекты",callback_data="mybots")]]),parse_mode="HTML")
-                except Exception: pass
-        elif result=="REJECTED":
-            try: await bot.send_message(uid,"❌ <b>Оплата не подтверждена.</b>\nОтправь два чётких скриншота повторно через кассира.",parse_mode="HTML")
-            except Exception: pass
-    except Exception: logger.exception("payment_result error")
+        parts = message.text.strip().split()
+        if len(parts) < 6 or not SYNC_SECRET:
+            return
+        uid = int(parts[1])
+        plan = parts[2]
+        result = parts[3].upper()
+        grant_id = parts[4]
+        sig = parts[5]
+        expected = hmac.new(SYNC_SECRET.encode(), f"result:{uid}:{plan}:{result}:{grant_id}".encode(), hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(sig, expected) or plan not in PLANS:
+            return
+        if result == "APPROVED":
+            res = add_subscription(uid, plan, grant_id=grant_id)
+            if res:
+                await send_sub_activated(uid, plan, res)
+        elif result == "REJECTED":
+            try:
+                await bot.send_message(uid, "❌ <b>Оплата не подтверждена.</b>\nОтправь два чётких скриншота повторно через кассира.", parse_mode="HTML")
+            except Exception:
+                pass
+    except Exception:
+        logger.exception("payment_result error")
+
 
 @dp.channel_post(F.text.startswith("/auto_grant"))
 async def channel_auto_grant(message: types.Message):
-    """Выдача слота от кассира: /auto_grant USER_ID PLAN GRANT_ID SIGNATURE."""
+    """Выдача подписки от кассира: /auto_grant USER_ID PLAN GRANT_ID SIGNATURE."""
     try:
         parts = message.text.strip().split()
         if len(parts) < 5 or not SYNC_SECRET:
@@ -802,52 +1272,59 @@ async def channel_auto_grant(message: types.Message):
         uid = int(parts[1])
         plan = parts[2]
         grant_id = parts[3]
-        signature = parts[4] if len(parts) > 4 else ""
-        expected_signature = hmac.new(
-            SYNC_SECRET.encode(), f"{uid}:{plan}:{grant_id}".encode(), hashlib.sha256
-        ).hexdigest()
+        signature = parts[4]
+        expected_signature = hmac.new(SYNC_SECRET.encode(), f"{uid}:{plan}:{grant_id}".encode(), hashlib.sha256).hexdigest()
         if not hmac.compare_digest(signature, expected_signature) or plan not in PLANS or not re.fullmatch(r"[A-Za-z0-9_-]{8,80}", grant_id):
             logger.warning("Отклонён auto_grant: проверка подписи не пройдена")
             return
-        def grant_once(conn):
-            row = conn.execute("SELECT 1 FROM auto_grants WHERE grant_id = ?", (grant_id,)).fetchone()
-            if row:
-                return False
-            conn.execute("INSERT INTO auto_grants(grant_id,user_id,plan,created_at) VALUES(?,?,?,?)",
-                         (grant_id, uid, plan, datetime.now().isoformat()))
-            conn.execute("INSERT INTO users(user_id, username, full_name, created_at) VALUES(?, '', '', ?) ON CONFLICT(user_id) DO NOTHING",
-                         (uid, datetime.now().isoformat()))
-            exp = datetime.now() + timedelta(days=PLANS[plan]["days"])
-            conn.execute("INSERT INTO slots(user_id, plan, expires_at, created_at) VALUES(?,?,?,?)",
-                         (uid, plan, exp.isoformat(), datetime.now().isoformat()))
-            return True
-        created = _db_retry(grant_once)
-        if not created:
+        res = add_subscription(uid, plan, grant_id=grant_id)
+        if not res:
             logger.info("Повторный auto_grant %s проигнорирован", grant_id)
             return
-        plan_info = PLANS[plan]
+        await send_sub_activated(uid, plan, res)
         try:
-            await bot.send_message(
-                uid,
-                "🎉 <b>Оплата подтверждена!</b>\n\n"
-                f"💎 Тариф <b>{plan_info['name']}</b> · {plan_info['days']} дней\n"
-                "🚀 Слот уже активен — можно загружать проект.",
-                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                    [InlineKeyboardButton(text="📤 Загрузить проект", callback_data="upload")],
-                    [InlineKeyboardButton(text="🤖 Мои проекты", callback_data="mybots")],
-                    [InlineKeyboardButton(text="« Главное меню", callback_data="back_main")]
-                ]),
-                parse_mode="HTML"
-            )
-        except Exception as e:
-            logger.warning("Не удалось уведомить user %s: %s", uid, e)
-        try:
-            await message.reply(f"✅ Слот выдан · <code>{uid}</code> · {html.escape(plan_info['name'])}", parse_mode="HTML")
+            await message.reply(
+                f"✅ Подписка выдана · <code>{uid}</code> · {html.escape(PLANS[plan]['name'])} · до <b>{fmt_dt(res['expires_at'])}</b>",
+                parse_mode="HTML")
         except Exception:
             pass
         logger.info("Auto-grant: user=%s plan=%s grant=%s", uid, plan, grant_id)
     except Exception as e:
         logger.exception("auto_grant error: %s", e)
+
+
+async def send_sub_activated(uid, pid, res):
+    """Красивое уведомление об активации/продлении подписки."""
+    p = PLANS[pid]
+    kind_info = KINDS[p["kind"]]
+    if res.get("extended"):
+        head = "🎉 <b>Подписка продлена!</b>"
+    elif res.get("mode") == "new":
+        head = "➕ <b>Добавлен новый слот!</b>"
+    else:
+        head = "🎉 <b>Оплата подтверждена!</b>"
+    lim = get_limits(uid)
+    limit_line = "🚀 Ботов можно запускать <b>без лимита</b>." if lim["unlimited"] else f"🧩 Доступно слотов: <b>{lim['slots']}</b>."
+    try:
+        await bot.send_message(
+            uid,
+            f"{head}\n\n"
+            f"{kind_info['emoji']} <b>{kind_info['name']}</b>\n"
+            f"{p['emoji']} Тариф: <b>{p['name']}</b> (+{p['days']} дн.)\n"
+            f"⏳ Действует до: <b>{fmt_dt(res['expires_at'])}</b>\n"
+            f"📦 Осталось: <b>{human_left(res['expires_at'].isoformat())}</b>\n\n"
+            f"{limit_line}",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="📤 Загрузить проект", callback_data="upload")],
+                [InlineKeyboardButton(text="🤖 Мои проекты", callback_data="mybots"),
+                 InlineKeyboardButton(text="📦 Моя подписка", callback_data="myslots")],
+                [InlineKeyboardButton(text="« Главное меню", callback_data="back_main")]
+            ]),
+            parse_mode="HTML"
+        )
+    except Exception as e:
+        logger.warning("Не удалось уведомить user %s: %s", uid, e)
+
 
 # ═══════════════════════════════════════════════════════════════
 # 🎯 СТАРТ / МЕНЮ
@@ -858,39 +1335,58 @@ async def cmd_start(message: types.Message, state: FSMContext):
     await state.clear()
     create_user(message.from_user.id, message.from_user.username or "", message.from_user.full_name or "")
     name = html.escape(message.from_user.first_name or "друг")
+    lim = get_limits(message.from_user.id)
+    if lim["unlimited"]:
+        sub_line = "🚀 Твой режим: <b>боты без лимита</b>" + (f" · до {fmt_dt(datetime.fromisoformat(lim['until']))}" if lim.get("until") else "")
+    elif lim["slots"]:
+        used = len(get_user_bots(message.from_user.id))
+        sub_line = f"🧩 Слотов: <b>{used}/{lim['slots']}</b>" + (f" · до {fmt_dt(datetime.fromisoformat(lim['until']))}" if lim.get("until") else "")
+    else:
+        sub_line = "📦 Активной подписки нет — боты не запускаются"
     text = (
         f"👋 <b>Привет, {name}!</b>\n\n"
         f"Добро пожаловать в <b>BotHost</b> — загрузил проект, настроил переменные и запускаешь. 🚀\n\n"
+        f"{sub_line}\n\n"
         f"<b>Что умеет хостинг:</b>\n"
         f"• 📦 .py и .zip проекты\n"
         f"• 📚 автоматическая установка библиотек\n"
         f"• 🔄 авто-рестарт и контроль состояния\n"
         f"• 📄 логи + 🧠 ИИ-помощник\n"
-        f"• ⚙️ переменные окружения без .env-файлов\n\n"
+        f"• ⚙️ переменные окружения без .env-файлов\n"
+        f"• 🔔 напоминание об оплате за 3 дня до конца\n\n"
         f"Выбери действие ниже — дальше всё делается кнопками."
     )
     await message.answer(text, reply_markup=main_menu_kb(message.from_user.id), parse_mode="HTML")
+
 
 @dp.message(Command("cancel"))
 async def cmd_cancel(message: types.Message, state: FSMContext):
     await state.clear()
     await message.answer("❌ Действие отменено.", reply_markup=main_menu_kb(message.from_user.id))
 
+
+@dp.message(Command("myslots"))
+async def cmd_myslots(message: types.Message, state: FSMContext):
+    await state.clear()
+    text, kb = subs_page(message.from_user.id)
+    await message.answer(text, reply_markup=kb, parse_mode="HTML")
+
+
 @dp.callback_query(F.data == "back_main")
 async def back_main(call: types.CallbackQuery, state: FSMContext):
     await state.clear()
+    lim = get_limits(call.from_user.id)
+    if lim["unlimited"]:
+        head = "🏠 <b>BotHost</b> · 🚀 без лимита ботов"
+    elif lim["slots"]:
+        head = f"🏠 <b>BotHost</b> · 🧩 слотов: {len(get_user_bots(call.from_user.id))}/{lim['slots']}"
+    else:
+        head = "🏠 <b>BotHost</b> · 📦 подписки нет"
     try:
-        await call.message.edit_text(
-            "🏠 <b>BotHost</b>",
-            reply_markup=main_menu_kb(call.from_user.id),
-            parse_mode="HTML"
-        )
+        await call.message.edit_text(head, reply_markup=main_menu_kb(call.from_user.id), parse_mode="HTML")
     except Exception:
-        await call.message.answer(
-            "🏠 <b>BotHost</b>",
-            reply_markup=main_menu_kb(call.from_user.id),
-            parse_mode="HTML"
-        )
+        await call.message.answer(head, reply_markup=main_menu_kb(call.from_user.id), parse_mode="HTML")
+
 
 # ═══════════════════════════════════════════════════════════════
 # 🛡 БЕЗОПАСНАЯ РАБОТА С ZIP
@@ -899,6 +1395,7 @@ async def back_main(call: types.CallbackQuery, state: FSMContext):
 MAX_UPLOAD_BYTES = 20 * 1024 * 1024
 MAX_ZIP_FILES = 500
 MAX_ZIP_UNCOMPRESSED = 100 * 1024 * 1024
+
 
 def safe_extract_zip(zf: zipfile.ZipFile, destination: Path):
     infos = zf.infolist()
@@ -919,6 +1416,7 @@ def safe_extract_zip(zf: zipfile.ZipFile, destination: Path):
         with zf.open(info) as src_f, open(target, "wb") as dst_f:
             shutil.copyfileobj(src_f, dst_f)
 
+
 def get_python_files(bot_dir: Path) -> list[str]:
     """Все возможные точки входа внутри папки бота."""
     result = []
@@ -936,9 +1434,11 @@ def get_python_files(bot_dir: Path) -> list[str]:
     result.sort(key=lambda x: (preferred.get(Path(x).name, 50), len(Path(x).parts), x.lower()))
     return result
 
+
 def find_entry_point(bot_dir: Path) -> str:
     files = get_python_files(bot_dir)
     return files[0] if files else ""
+
 
 def resolve_entry_point(bot_id: int, bot_dir: Path, stored: str) -> str:
     """Не даём старой записи user_bot.py ломать запуск, если такого файла уже нет."""
@@ -952,6 +1452,7 @@ def resolve_entry_point(bot_id: int, bot_dir: Path, stored: str) -> str:
         update_bot_entry(bot_id, detected)
         return detected
     return ""
+
 
 # ═══════════════════════════════════════════════════════════════
 # 📤 ЗАГРУЗКА ФАЙЛОВ
@@ -1002,23 +1503,41 @@ async def handle_files(message: types.Message, state: FSMContext):
             finfo = await bot.get_file(doc.file_id)
             await bot.download_file(finfo.file_path, destination=DB_PATH)
             init_db()
-            restored=0
+            restored = 0
             for b in get_all_bots():
-                if await restore_bot_files(b[0]): restored += 1
-            return await message.answer(f"✅ <b>Память восстановлена!</b>\n\n🤖 Записей ботов: <b>{len(get_all_bots())}</b>\n📦 Файловых архивов восстановлено: <b>{restored}</b>", parse_mode="HTML")
+                if await restore_bot_files(b[0]):
+                    restored += 1
+            return await message.answer(
+                f"✅ <b>Память восстановлена!</b>\n\n🤖 Записей ботов: <b>{len(get_all_bots())}</b>\n"
+                f"📦 Файловых архивов восстановлено: <b>{restored}</b>\n"
+                f"📊 Активных подписок: <b>{get_stats()['slots'] + get_stats()['hosts']}</b>",
+                parse_mode="HTML")
         except Exception as e:
             return await message.answer(f"❌ Ошибка: {e}")
 
     # Новый бот
-    if not has_active_slot(uid):
+    allowed, reason = can_add_bot(uid)
+    if not allowed:
+        lim = get_limits(uid)
+        if not lim["subs"]:
+            return await message.answer(
+                "❌ <b>Нет активной подписки!</b>\nКупи тариф или введи промокод.",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(text="💎 Тарифы", callback_data="buy"),
+                     InlineKeyboardButton(text="🎁 Промокод", callback_data="promo_enter")]
+                ]),
+                parse_mode="HTML")
         return await message.answer(
-            "❌ <b>Нет активного слота!</b>\nКупи слот или введи промокод.",
+            f"❌ <b>Все слоты заняты</b> ({reason}).\n\n"
+            "• удали ненужного бота — слот освободится,\n"
+            "• или купи ещё слот,\n"
+            "• или возьми 🚀 <b>хостинг без лимита</b> — ботов сколько угодно.",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="💎 Купить", callback_data="buy"),
-                 InlineKeyboardButton(text="🎁 Промокод", callback_data="promo_enter")]
+                [InlineKeyboardButton(text="🚀 Хостинг без лимита", callback_data="buykind:host")],
+                [InlineKeyboardButton(text="🧩 Ещё слот", callback_data="buykind:bot")],
+                [InlineKeyboardButton(text="🤖 Мои проекты", callback_data="mybots")]
             ]),
-            parse_mode="HTML"
-        )
+            parse_mode="HTML")
     if ext not in ("py", "zip"):
         return await message.answer("❌ Только <b>.py</b> или <b>.zip</b>", parse_mode="HTML")
 
@@ -1028,8 +1547,8 @@ async def handle_files(message: types.Message, state: FSMContext):
         f"✅ <b>Файл {html.escape(fname)} получен!</b>\n\n"
         f"Отправь <b>токен</b> от @BotFather\n"
         f"или напиши <code>none</code>",
-        parse_mode="HTML"
-    )
+        parse_mode="HTML")
+
 
 @dp.message(UploadStates.waiting_token, F.text)
 async def handle_token(message: types.Message, state: FSMContext):
@@ -1044,8 +1563,6 @@ async def handle_token(message: types.Message, state: FSMContext):
     data = await state.get_data()
     msg = await message.answer("⏳ <i>Распаковка проекта...</i>", parse_mode="HTML")
     try:
-        # Точку входа выбираем после распаковки проекта.
-        # Для одиночного .py сохраняем исходное имя файла, а не переименовываем его в user_bot.py.
         ep = ""
         bid = save_bot(message.from_user.id, data["fname"], token, ep)
         bot_dir = BOTS_DIR / f"bot_{bid}"
@@ -1060,45 +1577,52 @@ async def handle_token(message: types.Message, state: FSMContext):
                 safe_extract_zip(z, bot_dir)
             dpath.unlink(missing_ok=True)
         else:
-            # Одиночный файл остаётся под своим именем: например cashier.py, main.py и т.д.
             target = bot_dir / data["fname"]
-            dpath.replace(target)
+            if dpath != target:
+                dpath.replace(target)
 
         ep = find_entry_point(bot_dir)
         update_bot_entry(bid, ep)
         if ep:
             write_wrapper(bot_dir, ep)
-        files = get_python_files(bot_dir)
         await archive_bot_files(bid)
+        lim = get_limits(message.from_user.id)
+        slot_line = ("🚀 Слотов неограниченно" if lim["unlimited"]
+                     else f"🧩 Занято слотов: <b>{len(get_user_bots(message.from_user.id))}/{lim['slots']}</b>")
         if not ep:
             await msg.edit_text(
                 f"⚠️ <b>Бот #{bid} загружен, но .py файл не найден.</b>\n\n"
-                "Добавь Python-файл через «📁 Файлы»."
-            )
+                "Добавь Python-файл через «📁 Файлы».")
         else:
             await msg.edit_text(
                 f"✅ <b>Бот #{bid} развёрнут!</b>\n"
-                f"🚀 Точка входа: <code>{html.escape(ep)}</code>\n\n"
+                f"🚀 Точка входа: <code>{html.escape(ep)}</code>\n"
+                f"{slot_line}\n\n"
                 f"Если нужно запустить другой .py файл — открой «🤖 Мои проекты» → бот → «📄 Точка входа».",
                 reply_markup=InlineKeyboardMarkup(inline_keyboard=[
                     [InlineKeyboardButton(text="📄 Точка входа", callback_data=f"entry:{bid}")],
                     [InlineKeyboardButton(text="🤖 Мои проекты", callback_data="mybots")]
                 ]),
-                parse_mode="HTML"
-            )
+                parse_mode="HTML")
     except Exception as e:
         await msg.edit_text(f"❌ Ошибка: {e}")
     await state.clear()
+
 
 @dp.message(UploadStates.waiting_token)
 async def handle_token_wrong(message: types.Message):
     await message.answer("⚠️ Отправь токен <b>текстом</b> или <code>none</code>", parse_mode="HTML")
 
+
 @dp.callback_query(F.data == "upload")
 async def cb_upload(call: types.CallbackQuery, state: FSMContext):
     await state.clear()
-    if not has_active_slot(call.from_user.id):
-        return await call.answer("❌ Нет активного слота", show_alert=True)
+    allowed, reason = can_add_bot(call.from_user.id)
+    if not allowed:
+        lim = get_limits(call.from_user.id)
+        if not lim["subs"]:
+            return await call.answer("❌ Нет активной подписки", show_alert=True)
+        return await call.answer(f"❌ Все слоты заняты ({reason}). Удали бота или возьми хостинг.", show_alert=True)
     await state.set_state(UploadStates.waiting_file)
     await call.message.edit_text(
         "📤 <b>Загрузка проекта</b>\n\n"
@@ -1108,128 +1632,235 @@ async def cb_upload(call: types.CallbackQuery, state: FSMContext):
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="« Отмена", callback_data="back_main")]
         ]),
-        parse_mode="HTML"
-    )
+        parse_mode="HTML")
+
 
 # ═══════════════════════════════════════════════════════════════
-# 💎 ОПЛАТА + СЛОТЫ + ПРОМО
+# 💎 ТАРИФЫ + ПОДПИСКИ
 # ═══════════════════════════════════════════════════════════════
+
+def subs_page(uid):
+    """Страница «📦 Моя подписка»: лимиты, сроки, прогресс, кнопки продления."""
+    if is_admin(uid):
+        return ("📦 <b>Моя подписка</b>\n\n👑 <b>Безлимит</b> — админ-доступ.\nБотов можно запускать сколько угодно.",
+                InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(text="📤 Загрузить проект", callback_data="upload")],
+                    [InlineKeyboardButton(text="« Меню", callback_data="back_main")]]))
+
+    lim = get_limits(uid)
+    subs = lim["subs"]
+    used = len(get_user_bots(uid))
+    now = datetime.now()
+
+    text = "📦 <b>Моя подписка</b>\n\n"
+    if lim["unlimited"]:
+        text += "🚀 <b>Режим: хостинг без лимита ботов</b>\n"
+    else:
+        text += f"🧩 <b>Слотов: {used}/{lim['slots'] or 0}</b>\n"
+    text += f"🤖 Проектов загружено: <b>{used}</b>\n"
+
+    active = [s for s in subs if datetime.fromisoformat(s[4]) > now]
+    expired_grace = [s for s in subs if datetime.fromisoformat(s[4]) <= now]
+
+    if not subs:
+        text += "\n❌ <b>Активной подписки нет.</b>\nБоты не запускаются — выбери тариф ниже.\n"
+    else:
+        if active:
+            text += "\n<b>Активные:</b>\n"
+        for s in active:
+            p = PLANS.get(s[3], {})
+            kind_info = KINDS.get(s[2], KINDS["bot"])
+            exp = datetime.fromisoformat(s[4])
+            total = max(1, (s[5] or p.get("days", 1))) * 86400
+            left = max(0.0, (exp - now).total_seconds())
+            text += (f"\n{kind_info['emoji']} <b>{p.get('name', s[3])}</b>\n"
+                     f"   {bar(left / total)} {human_left(s[4])}\n"
+                     f"   до <b>{fmt_dt(exp)}</b>\n")
+        for s in expired_grace:
+            p = PLANS.get(s[3], {})
+            kind_info = KINDS.get(s[2], KINDS["bot"])
+            text += (f"\n⚠️ {kind_info['emoji']} <b>{p.get('name', s[3])}</b> — истекла\n"
+                     f"   льготный период ещё {(datetime.fromisoformat(s[4]) + timedelta(hours=GRACE_HOURS) - now).total_seconds() // 3600:.0f} ч\n")
+
+    kinds_present = {s[2] for s in subs}
+    rows = []
+    if "bot" in kinds_present or not kinds_present:
+        rows.append([InlineKeyboardButton(text="🧩 Продлить слот на 1 бота", callback_data="buykind:bot")])
+    if "host" in kinds_present:
+        rows.append([InlineKeyboardButton(text="🚀 Продлить хостинг", callback_data="buykind:host")])
+    else:
+        rows.append([InlineKeyboardButton(text="🚀 Хостинг без лимита (выгоднее от 3 ботов)", callback_data="buykind:host")])
+    rows.append([InlineKeyboardButton(text="💳 Все тарифы", callback_data="buy")])
+    rows.append([InlineKeyboardButton(text="« Меню", callback_data="back_main")])
+    return text, InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+@dp.callback_query(F.data == "myslots")
+async def cb_myslots(call: types.CallbackQuery, state: FSMContext):
+    await state.clear()
+    text, kb = subs_page(call.from_user.id)
+    try:
+        await call.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
+    except Exception:
+        await call.message.answer(text, reply_markup=kb, parse_mode="HTML")
+
 
 @dp.callback_query(F.data == "buy")
 async def cb_buy(call: types.CallbackQuery, state: FSMContext):
     await state.clear()
     if is_admin(call.from_user.id):
         return await call.message.edit_text(
-            "👑 <b>У тебя безлимит!</b>",
+            "👑 <b>У тебя безлимит!</b>\nЗагружай сколько нужно.",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[
                 [InlineKeyboardButton(text="📤 Загрузить", callback_data="upload")],
-                [InlineKeyboardButton(text="« Меню", callback_data="back_main")]
-            ]),
-            parse_mode="HTML"
-        )
-    text = "💎 <b>Выбери тариф</b>\n\nОплата подарком (⭐) владельцу"
+                [InlineKeyboardButton(text="« Меню", callback_data="back_main")]]),
+            parse_mode="HTML")
+    bot_min = min(p["stars"] for _, p in plans_of_kind("bot"))
+    host_min = min(p["stars"] for _, p in plans_of_kind("host"))
+    text = (
+        "💎 <b>Тарифы BotHost</b>\n\n"
+        f"🧩 <b>Слот на 1 бота</b> — от {bot_min}⭐\n"
+        "<i>Одна подписка = один работающий бот. Удалил бота — слот свободен.</i>\n\n"
+        f"🚀 <b>Хостинг без лимита</b> — от {host_min}⭐\n"
+        "<i>Ботов сколько угодно, срок общий. Выгодно от 3 ботов.</i>\n\n"
+        "♻️ Продление <b>стакается</b>: остаток дней не сгорает.\n"
+        "➕ Нужен ещё один бот — докупи слот (тот же тариф, кнопка «➕ Ещё один слот»).\n"
+        "🔔 Напомним за 3 дня до окончания."
+    )
     kb = [
-        [InlineKeyboardButton(text=f"📅 Неделя — {PLANS['week']['stars']}⭐", callback_data="plan:week")],
-        [InlineKeyboardButton(text=f"🗓 2 недели — {PLANS['2weeks']['stars']}⭐", callback_data="plan:2weeks")],
-        [InlineKeyboardButton(text=f"💎 Месяц — {PLANS['month']['stars']}⭐", callback_data="plan:month")],
+        [InlineKeyboardButton(text=f"🧩 Слот на 1 бота · от {bot_min}⭐", callback_data="buykind:bot")],
+        [InlineKeyboardButton(text=f"🚀 Хостинг без лимита · от {host_min}⭐", callback_data="buykind:host")],
+        [InlineKeyboardButton(text="📦 Моя подписка", callback_data="myslots")],
         [InlineKeyboardButton(text="« Меню", callback_data="back_main")]
     ]
     await call.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=kb), parse_mode="HTML")
 
+
+@dp.callback_query(F.data.startswith("buykind:"))
+async def cb_buykind(call: types.CallbackQuery, state: FSMContext):
+    await state.clear()
+    kind = call.data.split(":", 1)[1]
+    if kind not in KINDS:
+        return await call.answer("Неизвестный тип тарифа", show_alert=True)
+    info = KINDS[kind]
+    text = (
+        f"{info['emoji']} <b>{info['name']}</b>\n\n"
+        f"{info['hint']}\n\n"
+        "♻️ Если подписка уже активна — новые дни прибавятся к текущей дате.\n"
+        "Выбери срок:"
+    )
+    await call.message.edit_text(text, reply_markup=tariffs_kb(kind), parse_mode="HTML")
+
+
 @dp.callback_query(F.data.startswith("plan:"))
 async def cb_plan(call: types.CallbackQuery, state: FSMContext):
     await state.clear()
-    pid = call.data.split(":")[1]
-    p = PLANS[pid]
+    parts = call.data.split(":")
+    pid = parts[1] if len(parts) > 1 else ""
+    mode = parts[2] if len(parts) > 2 else ""
+    p = PLANS.get(pid)
+    if not p:
+        return await call.answer("Тариф недоступен", show_alert=True)
+    kind_info = KINDS[p["kind"]]
+    uid = call.from_user.id
+    lim = get_limits(uid)
+    until = lim.get("until")
+
+    # Шаг 1: для слотов даём выбрать — продлить срок или добавить слот.
+    if not mode:
+        if p["kind"] == "bot" and has_sub_of_kind(uid, "bot") and not lim["unlimited"]:
+            text = (
+                f"{p['emoji']} <b>{p['name']}</b> · {p['stars']}⭐ / {p['days']} дн.\n\n"
+                f"📦 Сейчас: слотов <b>{lim['slots']}</b>, ботов <b>{len(get_user_bots(uid))}</b>"
+                + (f", срок до <b>{fmt_dt(datetime.fromisoformat(until))}</b>" if until else "") + "\n\n"
+                "Что делаем?\n"
+                "♻️ <b>Продлить</b> — +дни к текущему сроку, остаток не сгорает.\n"
+                "➕ <b>Ещё один слот</b> — сможешь запускать на одного бота больше."
+            )
+            kb = [
+                [InlineKeyboardButton(text="♻️ Продлить текущий срок", callback_data=f"plan:{pid}:extend")],
+                [InlineKeyboardButton(text="➕ Купить ещё один слот", callback_data=f"plan:{pid}:new")],
+                [InlineKeyboardButton(text="🚀 Хостинг без лимита", callback_data="buykind:host")],
+                [InlineKeyboardButton(text="« Тарифы", callback_data="buy")]
+            ]
+            return await call.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=kb), parse_mode="HTML")
+        mode = "extend"
+
+    if mode not in ("extend", "new"):
+        mode = "extend"
+    if p["kind"] == "host":
+        mode = "extend"
+
+    stack_line = ""
+    if mode == "extend" and until and datetime.fromisoformat(until) > datetime.now():
+        new_exp = datetime.fromisoformat(until) + timedelta(days=p["days"])
+        stack_line = f"\n♻️ Продление: +{p['days']} дн. к текущим <b>{human_left(until)}</b> → до <b>{fmt_dt(new_exp)}</b>"
+    elif mode == "new":
+        stack_line = f"\n➕ Новый слот: срок пойдёт с сегодня → до <b>{fmt_dt(datetime.now() + timedelta(days=p['days']))}</b>"
+
     text = (
         f"{p['emoji']} <b>Тариф: {p['name']}</b>\n\n"
-        f"💎 {p['stars']}⭐  •  📅 {p['days']} дней\n\n"
+        f"{kind_info['emoji']} {kind_info['name']}\n"
+        f"💎 {p['stars']}⭐  •  📅 {p['days']} дней{stack_line}\n\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"<b>Как оплатить:</b>\n"
         f"1️⃣ «🎁 Отправить подарок» → владельцу\n"
-        f"2️⃣ Отправь подарок от <b>{p['stars']}⭐</b>\n"
+        f"2️⃣ Отправь подарок ровно на <b>{p['stars']}⭐</b>\n"
         f"3️⃣ Вернись и нажми «✅ Я оплатил»\n\n"
-        f"⚡ Или <b>мгновенно через ИИ-кассира</b> — скинь скрин, слот сразу!"
+        f"⚡ Или <b>мгновенно через ИИ-кассира</b> — скинь скрин, подписка активируется сразу."
     )
     kb = [
         [InlineKeyboardButton(text="🎁 Отправить подарок", url=get_profile_link())],
-        [InlineKeyboardButton(
-            text="⚡ Оплатить через ИИ-кассира",
-            url=f"https://t.me/{VERIFIER_BOT_USERNAME}?start={pid}"
-        )],
-        [InlineKeyboardButton(text="✅ Я оплатил (ручная проверка)", callback_data=f"pay_done:{pid}")],
+        [InlineKeyboardButton(text="⚡ Оплатить через ИИ-кассира", url=f"https://t.me/{VERIFIER_BOT_USERNAME}?start={pid}")],
+        [InlineKeyboardButton(text="✅ Я оплатил (ручная проверка)", callback_data=f"pay_done:{pid}:{mode}")],
         [InlineKeyboardButton(text="« Тарифы", callback_data="buy")]
     ]
     await call.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=kb), parse_mode="HTML", disable_web_page_preview=True)
 
+
 @dp.callback_query(F.data.startswith("pay_done:"))
 async def cb_pay_done(call: types.CallbackQuery, state: FSMContext):
     await state.clear()
-    pid = call.data.split(":")[1]
-    p = PLANS[pid]
+    parts = call.data.split(":")
+    pid = parts[1] if len(parts) > 1 else ""
+    mode = parts[2] if len(parts) > 2 else "extend"
+    if mode not in ("extend", "new"):
+        mode = "extend"
+    p = PLANS.get(pid)
+    if not p:
+        return await call.answer("Тариф недоступен", show_alert=True)
+    if p["kind"] == "host":
+        mode = "extend"
     u = call.from_user
     if user_has_pending_request(u.id):
         return await call.answer("⏳ Уже есть заявка на проверке!", show_alert=True)
-    rid = create_payment_request(u.id, u.username or "", u.full_name or "", pid)
+    rid = create_payment_request(u.id, u.username or "", u.full_name or "", pid, mode)
+    kind_info = KINDS[p["kind"]]
+    mode_line = "♻️ Продление текущего срока" if mode == "extend" else "➕ Новый слот"
     await call.message.edit_text(
         f"✅ <b>Заявка #{rid} отправлена!</b>\n\n"
-        f"{p['emoji']} {p['name']} ({p['stars']}⭐)\n"
+        f"{kind_info['emoji']} {kind_info['name']}\n"
+        f"{p['emoji']} {p['name']} · {p['days']} дн. ({p['stars']}⭐)\n"
+        f"{mode_line}\n"
         f"⏳ Админ проверит оплату.\n\n"
         f"💡 Быстрее: оплати через ИИ-кассира в тарифах!",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="« Меню", callback_data="back_main")]
-        ]),
-        parse_mode="HTML"
-    )
+            [InlineKeyboardButton(text="« Меню", callback_data="back_main")]]),
+        parse_mode="HTML")
     try:
-        kb_adm = InlineKeyboardMarkup(inline_keyboard=[[
-            InlineKeyboardButton(text="✅ Одобрить", callback_data=f"approve:{rid}"),
-            InlineKeyboardButton(text="❌ Отклонить", callback_data=f"reject:{rid}")
-        ]])
         await bot.send_message(
             OWNER_ID,
             f"💰 <b>Заявка #{rid}</b>\n\n👤 @{u.username or '—'} (<code>{u.id}</code>)\n"
-            f"{p['emoji']} <b>{p['name']}</b> ({p['stars']}⭐)",
-            reply_markup=kb_adm,
-            parse_mode="HTML"
-        )
+            f"{kind_info['emoji']} {kind_info['name']}\n"
+            f"{p['emoji']} <b>{p['name']}</b> · {p['days']} дн. ({p['stars']}⭐)\n"
+            f"{mode_line}",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                InlineKeyboardButton(text="✅ Одобрить", callback_data=f"approve:{rid}"),
+                InlineKeyboardButton(text="❌ Отклонить", callback_data=f"reject:{rid}")]]),
+            parse_mode="HTML")
     except Exception:
         pass
 
-@dp.callback_query(F.data == "myslots")
-async def cb_myslots(call: types.CallbackQuery, state: FSMContext):
-    await state.clear()
-    if is_admin(call.from_user.id):
-        return await call.message.edit_text(
-            "👑 <b>Безлимит</b>",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="« Меню", callback_data="back_main")]
-            ]),
-            parse_mode="HTML"
-        )
-    slots = get_active_slots(call.from_user.id)
-    if not slots:
-        return await call.message.edit_text(
-            "💳 <b>Нет активных слотов</b>",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="💎 Купить", callback_data="buy")],
-                [InlineKeyboardButton(text="« Меню", callback_data="back_main")]
-            ]),
-            parse_mode="HTML"
-        )
-    text = f"📊 <b>Слоты ({len(slots)})</b>\n\n"
-    for s in slots:
-        exp = datetime.fromisoformat(s[3])
-        left = (exp - datetime.now()).days
-        text += f"• <b>{PLANS.get(s[2], {}).get('name', s[2])}</b> — ещё {left} дн.\n"
-    await call.message.edit_text(
-        text,
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="💎 Купить ещё", callback_data="buy")],
-            [InlineKeyboardButton(text="« Меню", callback_data="back_main")]
-        ]),
-        parse_mode="HTML"
-    )
 
 @dp.callback_query(F.data == "promo_enter")
 async def cb_promo_enter(call: types.CallbackQuery, state: FSMContext):
@@ -1237,10 +1868,9 @@ async def cb_promo_enter(call: types.CallbackQuery, state: FSMContext):
     await call.message.edit_text(
         "🎟 <b>Ввод промокода</b>\n\nОтправь код сообщением:",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="« Отмена", callback_data="back_main")]
-        ]),
-        parse_mode="HTML"
-    )
+            [InlineKeyboardButton(text="« Отмена", callback_data="back_main")]]),
+        parse_mode="HTML")
+
 
 @dp.message(UserStates.enter_promo)
 async def process_promo(message: types.Message, state: FSMContext):
@@ -1248,23 +1878,25 @@ async def process_promo(message: types.Message, state: FSMContext):
     ok, res = use_promo(message.from_user.id, code)
     if ok:
         p = PLANS[res]
+        lim = get_limits(message.from_user.id)
+        limit_line = "🚀 Теперь ботов можно запускать <b>без лимита</b>." if lim["unlimited"] else f"🧩 Доступно слотов: <b>{lim['slots']}</b>."
         await message.answer(
             f"🎉 <b>Промокод активирован!</b>\n\n"
-            f"Тариф: {p['emoji']} <b>{p['name']}</b> ({p['days']} дн.)",
+            f"{KINDS[p['kind']]['emoji']} {KINDS[p['kind']]['name']}\n"
+            f"Тариф: {p['emoji']} <b>{p['name']}</b> (+{p['days']} дн.)\n"
+            f"⏳ До: <b>{fmt_dt(datetime.fromisoformat(lim['until'])) if lim.get('until') else '—'}</b>\n\n{limit_line}",
             parse_mode="HTML",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[
                 [InlineKeyboardButton(text="➕ Новый бот", callback_data="upload")],
-                [InlineKeyboardButton(text="« Меню", callback_data="back_main")]
-            ])
-        )
+                [InlineKeyboardButton(text="📦 Моя подписка", callback_data="myslots")],
+                [InlineKeyboardButton(text="« Меню", callback_data="back_main")]]))
     else:
         await message.answer(
             res,
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="« Меню", callback_data="back_main")]
-            ])
-        )
+                [InlineKeyboardButton(text="« Меню", callback_data="back_main")]]))
     await state.clear()
+
 
 @dp.callback_query(F.data == "help")
 async def cb_help(call: types.CallbackQuery, state: FSMContext):
@@ -1272,22 +1904,29 @@ async def cb_help(call: types.CallbackQuery, state: FSMContext):
     text = (
         "❓ <b>Помощь</b>\n\n"
         "<b>🎁 Как начать:</b>\n"
-        "1. Купи слот или введи промокод\n"
-        "2. При покупке — подарок владельцу или ИИ-кассир\n"
+        "1. Выбери тариф — 🧩 слот на 1 бота или 🚀 хостинг без лимита\n"
+        "2. Оплати подарком владельцу или через ИИ-кассира\n"
         "3. Отправь .py / .zip → токен → Запуск\n\n"
-        "<b>⚡ ИИ-кассир:</b> в тарифах кнопка «Оплатить через ИИ» — "
-        "скинь скрин перевода, слот выдаётся сразу.\n\n"
-        "<b>📁 Файлы:</b> Мои боты → бот → Файлы / Добавить файл"
+        "<b>♻️ Продление:</b> остаток дней не сгорает — новый срок прибавляется "
+        "к текущей дате окончания. За 3 дня придёт напоминание с кнопками продления.\n\n"
+        "<b>➕ Нужно больше ботов?</b>\n"
+        "• 🧩 тариф на 1 бота → «Тарифы» → «➕ Купить ещё один слот» (каждый слот = +1 бот)\n"
+        "• 🚀 хостинг → ботов без лимита на весь срок подписки\n\n"
+        "<b>⏳ Если подписка истекла:</b> боты работают ещё 24 ч (льготный период), "
+        "потом останавливаются. Файлы и переменные сохраняются — после продления просто нажми «▶️ Запуск».\n\n"
+        "<b>⚡ ИИ-кассир:</b> в тарифах кнопка «Оплатить через ИИ» — скинь скрин перевода, "
+        "подписка выдаётся сразу.\n\n"
+        "<b>📁 Файлы:</b> Мои боты → бот → Файлы / Добавить файл\n"
+        "<b>⚙️ Переменные:</b> Мои боты → бот → Переменные (без .env-файлов)"
     )
     await call.message.edit_text(
         text,
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="💳 Тарифы", callback_data="buy")],
             [InlineKeyboardButton(text="👤 Владелец", url=get_profile_link())],
-            [InlineKeyboardButton(text="« Меню", callback_data="back_main")]
-        ]),
-        parse_mode="HTML",
-        disable_web_page_preview=True
-    )
+            [InlineKeyboardButton(text="« Меню", callback_data="back_main")]]),
+        parse_mode="HTML", disable_web_page_preview=True)
+
 
 # ═══════════════════════════════════════════════════════════════
 # 🤖 МОИ БОТЫ / УПРАВЛЕНИЕ
@@ -1298,27 +1937,28 @@ async def cb_mybots(call: types.CallbackQuery, state: FSMContext = None):
     if state:
         await state.clear()
     bots = get_user_bots(call.from_user.id)
+    lim = get_limits(call.from_user.id)
+    limit_line = "🚀 Без лимита" if lim["unlimited"] else f"🧩 {len(bots)}/{lim['slots'] or 0} слотов"
     if not bots:
         return await call.message.edit_text(
-            "🤖 <b>Нет ботов</b>\n\nЗагрузи первого!",
+            f"🤖 <b>Нет ботов</b> ({limit_line})\n\nЗагрузи первого!",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[
                 [InlineKeyboardButton(text="📤 Загрузить", callback_data="upload")],
-                [InlineKeyboardButton(text="« Меню", callback_data="back_main")]
-            ]),
-            parse_mode="HTML"
-        )
+                [InlineKeyboardButton(text="« Меню", callback_data="back_main")]]),
+            parse_mode="HTML")
     kb = []
     for b in bots:
         st = "🟢" if b[0] in running_bots else ("🧊" if b[6] else "🔴")
         name = (b[2] or "?")[:22]
         kb.append([InlineKeyboardButton(text=f"{st} #{b[0]} • {name}", callback_data=f"bot:{b[0]}")])
     kb.append([InlineKeyboardButton(text="📤 Загрузить ещё", callback_data="upload")])
+    kb.append([InlineKeyboardButton(text="📦 Моя подписка", callback_data="myslots")])
     kb.append([InlineKeyboardButton(text="« Меню", callback_data="back_main")])
     await call.message.edit_text(
-        f"🤖 <b>Твои боты ({len(bots)})</b>\n🟢 работает • 🔴 стоп • 🧊 заморожен",
+        f"🤖 <b>Твои боты ({len(bots)})</b> · {limit_line}\n🟢 работает • 🔴 стоп • 🧊 заморожен",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=kb),
-        parse_mode="HTML"
-    )
+        parse_mode="HTML")
+
 
 @dp.callback_query(F.data.startswith("bot:"))
 async def cb_bot_detail(call: types.CallbackQuery, state: FSMContext = None):
@@ -1332,6 +1972,9 @@ async def cb_bot_detail(call: types.CallbackQuery, state: FSMContext = None):
     status = "🧊 Заморожен" if b[6] else ("🟢 Работает" if bid in running_bots else "🔴 Остановлен")
     auto_r = "ВКЛ ✅" if (len(b) > 8 and b[8] == 1) else "ВЫКЛ ❌"
     ep = b[7] if len(b) > 7 else "user_bot.py"
+    lim = get_limits(b[1])
+    limits_line = "🚀 Без лимита ботов" if lim["unlimited"] else f"🧩 Слотов: {len(get_user_bots(b[1]))}/{lim['slots'] or 0}" + (
+        f" · до {fmt_dt(datetime.fromisoformat(lim['until']))}" if lim.get("until") else "")
 
     kb = [
         [InlineKeyboardButton(text="▶️ Запуск", callback_data=f"start:{bid}"),
@@ -1358,12 +2001,14 @@ async def cb_bot_detail(call: types.CallbackQuery, state: FSMContext = None):
         f"🤖 <b>Бот #{bid}</b>\n\n"
         f"📁 <code>{html.escape(str(b[2]))}</code>\n"
         f"🚀 <code>{html.escape(str(ep))}</code>\n"
-        f"📊 {status}"
+        f"📊 {status}\n"
+        f"📦 {limits_line}"
     )
     try:
         await call.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=kb), parse_mode="HTML")
     except Exception:
         await call.message.answer(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=kb), parse_mode="HTML")
+
 
 @dp.callback_query(F.data.startswith("entry:"))
 async def cb_entry_menu(call: types.CallbackQuery):
@@ -1380,16 +2025,15 @@ async def cb_entry_menu(call: types.CallbackQuery):
     for i, path in enumerate(files[:80]):
         mark = "✅ " if path == current else ""
         rows.append([InlineKeyboardButton(text=f"{mark}🐍 {path}"[:64], callback_data=f"entryset:{bid}:{i}")])
-    back = "bot:%s" % bid
-    rows.append([InlineKeyboardButton(text="« Назад", callback_data=back)])
+    rows.append([InlineKeyboardButton(text="« Назад", callback_data=f"bot:{bid}")])
     await call.message.edit_text(
         f"📄 <b>Выберите точку входа для бота #{bid}</b>\n\n"
         "Именно этот .py файл BotHost будет запускать.\n"
         f"Текущая: <code>{html.escape(current or 'не выбрана')}</code>",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
-        parse_mode="HTML"
-    )
+        parse_mode="HTML")
     await call.answer()
+
 
 @dp.callback_query(F.data.startswith("entryset:"))
 async def cb_entry_set(call: types.CallbackQuery):
@@ -1408,6 +2052,7 @@ async def cb_entry_set(call: types.CallbackQuery):
     await call.answer("✅ Точка входа изменена")
     await cb_bot_detail(call, None)
 
+
 @dp.callback_query(F.data.startswith("toggle_restart:"))
 async def cb_toggle_restart(call: types.CallbackQuery):
     bid = int(call.data.split(":")[1])
@@ -1418,6 +2063,7 @@ async def cb_toggle_restart(call: types.CallbackQuery):
     toggle_auto_restart(bid, 0 if cur == 1 else 1)
     await call.answer("Авто-рестарт переключён")
     await cb_bot_detail(call, None)
+
 
 @dp.callback_query(F.data.startswith("start:"))
 async def cb_start(call: types.CallbackQuery, state: FSMContext = None):
@@ -1431,6 +2077,8 @@ async def cb_start(call: types.CallbackQuery, state: FSMContext = None):
         return await call.answer("🧊 Заморожен!", show_alert=True)
     if bid in running_bots:
         return await call.answer("Уже запущен", show_alert=True)
+    if not has_active_slot(b[1]) and not is_admin(b[1]):
+        return await call.answer("📦 Подписка истекла — продли её", show_alert=True)
     await call.answer("⏳ Запуск...")
     ok = await start_user_bot(bid)
     if ok:
@@ -1442,9 +2090,8 @@ async def cb_start(call: types.CallbackQuery, state: FSMContext = None):
             parse_mode="HTML",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[
                 [InlineKeyboardButton(text="📄 Логи", callback_data=f"logs:{bid}")],
-                [InlineKeyboardButton(text="« К боту", callback_data=f"bot:{bid}")]
-            ])
-        )
+                [InlineKeyboardButton(text="« К боту", callback_data=f"bot:{bid}")]]))
+
 
 @dp.callback_query(F.data.startswith("stop:"))
 async def cb_stop(call: types.CallbackQuery):
@@ -1455,6 +2102,7 @@ async def cb_stop(call: types.CallbackQuery):
     await stop_user_bot(bid)
     await call.answer("⏹ Остановлен")
     await cb_bot_detail(call, None)
+
 
 @dp.callback_query(F.data.startswith("restart:"))
 async def cb_restart(call: types.CallbackQuery):
@@ -1470,6 +2118,7 @@ async def cb_restart(call: types.CallbackQuery):
     await start_user_bot(bid)
     await cb_bot_detail(call, None)
 
+
 @dp.callback_query(F.data.startswith("freeze:"))
 async def cb_freeze(call: types.CallbackQuery):
     if not is_admin(call.from_user.id):
@@ -1480,6 +2129,7 @@ async def cb_freeze(call: types.CallbackQuery):
     await call.answer("🧊 Заморожен")
     await cb_bot_detail(call, None)
 
+
 @dp.callback_query(F.data.startswith("unfreeze:"))
 async def cb_unfreeze(call: types.CallbackQuery):
     if not is_admin(call.from_user.id):
@@ -1489,38 +2139,74 @@ async def cb_unfreeze(call: types.CallbackQuery):
     await call.answer("♨️ Разморожен")
     await cb_bot_detail(call, None)
 
+
 @dp.callback_query(F.data.startswith("envmenu:"))
 async def cb_envmenu(call: types.CallbackQuery, state: FSMContext = None):
-    if state: await state.clear()
-    bid=int(call.data.split(":")[1]); b=get_bot(bid)
-    if not b or (b[1]!=call.from_user.id and not is_admin(call.from_user.id)): return await call.answer("❌ Нет доступа",show_alert=True)
-    envs=get_bot_env(bid); names=", ".join(envs.keys()) if envs else "пока не заданы"
-    await call.message.edit_text(f"⚙️ <b>Переменные · проект #{bid}</b>\n\nБез .env-файлов. Значения передаются процессу только при запуске.\n\nКлючи: <code>{html.escape(names[:800])}</code>",reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="✏️ Изменить переменные",callback_data=f"editenv:{bid}")],[InlineKeyboardButton(text="🧹 Очистить",callback_data=f"clearenv:{bid}")],[InlineKeyboardButton(text="« К проекту",callback_data=f"bot:{bid}")]]),parse_mode="HTML")
+    if state:
+        await state.clear()
+    bid = int(call.data.split(":")[1])
+    b = get_bot(bid)
+    if not b or (b[1] != call.from_user.id and not is_admin(call.from_user.id)):
+        return await call.answer("❌ Нет доступа", show_alert=True)
+    envs = get_bot_env(bid)
+    names = ", ".join(envs.keys()) if envs else "пока не заданы"
+    await call.message.edit_text(
+        f"⚙️ <b>Переменные · проект #{bid}</b>\n\nБез .env-файлов. Значения передаются процессу только при запуске.\n\n"
+        f"Ключи: <code>{html.escape(names[:800])}</code>",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="✏️ Изменить переменные", callback_data=f"editenv:{bid}")],
+            [InlineKeyboardButton(text="🧹 Очистить", callback_data=f"clearenv:{bid}")],
+            [InlineKeyboardButton(text="« К проекту", callback_data=f"bot:{bid}")]]),
+        parse_mode="HTML")
+
 
 @dp.callback_query(F.data.startswith("editenv:"))
-async def cb_editenv(call: types.CallbackQuery,state:FSMContext):
-    bid=int(call.data.split(":")[1]); b=get_bot(bid)
-    if not b or (b[1]!=call.from_user.id and not is_admin(call.from_user.id)): return await call.answer("❌ Нет доступа",show_alert=True)
-    curr=get_bot_env(bid); lines="\n".join(f"{k}={v}" for k,v in curr.items())
-    await state.set_state(EnvStates.waiting_env_text); await state.update_data(target_bid=bid)
-    await call.message.edit_text(f"✏️ <b>Переменные проекта #{bid}</b>\n\n<pre>{html.escape(lines[:3000] or 'пусто')}</pre>\n\nОтправь строки <code>KEY=VALUE</code>, каждая с новой строки.\n/cancel — отмена",parse_mode="HTML")
+async def cb_editenv(call: types.CallbackQuery, state: FSMContext):
+    bid = int(call.data.split(":")[1])
+    b = get_bot(bid)
+    if not b or (b[1] != call.from_user.id and not is_admin(call.from_user.id)):
+        return await call.answer("❌ Нет доступа", show_alert=True)
+    curr = get_bot_env(bid)
+    lines = "\n".join(f"{k}={v}" for k, v in curr.items())
+    await state.set_state(EnvStates.waiting_env_text)
+    await state.update_data(target_bid=bid)
+    await call.message.edit_text(
+        f"✏️ <b>Переменные проекта #{bid}</b>\n\n<pre>{html.escape(lines[:3000] or 'пусто')}</pre>\n\n"
+        "Отправь строки <code>KEY=VALUE</code>, каждая с новой строки.\n/cancel — отмена",
+        parse_mode="HTML")
+
 
 @dp.callback_query(F.data.startswith("clearenv:"))
 async def cb_clearenv(call: types.CallbackQuery):
-    bid=int(call.data.split(":")[1]); b=get_bot(bid)
-    if not b or (b[1]!=call.from_user.id and not is_admin(call.from_user.id)): return await call.answer("❌ Нет доступа",show_alert=True)
-    set_bot_env(bid,{}); await call.answer("Переменные очищены"); await cb_envmenu(call,None)
+    bid = int(call.data.split(":")[1])
+    b = get_bot(bid)
+    if not b or (b[1] != call.from_user.id and not is_admin(call.from_user.id)):
+        return await call.answer("❌ Нет доступа", show_alert=True)
+    set_bot_env(bid, {})
+    await call.answer("Переменные очищены")
+    await cb_envmenu(call, None)
+
 
 @dp.message(EnvStates.waiting_env_text)
-async def env_saved(message: types.Message,state:FSMContext):
-    data=await state.get_data(); bid=data["target_bid"]; parsed={}
+async def env_saved(message: types.Message, state: FSMContext):
+    data = await state.get_data()
+    bid = data["target_bid"]
+    parsed = {}
     for raw in (message.text or "").splitlines():
-        line=raw.strip()
-        if not line or line.startswith("#") or "=" not in line: continue
-        k,v=line.split("=",1); k=k.strip(); v=v.strip().strip("'\"")
-        if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*",k): parsed[k]=v
-    set_bot_env(bid,parsed); await state.clear()
-    await message.answer("✅ Переменные сохранены. Перезапусти проект, чтобы применить их.",reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="« К проекту",callback_data=f"bot:{bid}")]]))
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        k, v = line.split("=", 1)
+        k = k.strip()
+        v = v.strip().strip("'\"")
+        if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", k):
+            parsed[k] = v
+    set_bot_env(bid, parsed)
+    await state.clear()
+    await message.answer("✅ Переменные сохранены. Перезапусти проект, чтобы применить их.",
+                         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                             [InlineKeyboardButton(text="« К проекту", callback_data=f"bot:{bid}")]]))
+
 
 @dp.callback_query(F.data.startswith("ai:"))
 async def cb_ai(call: types.CallbackQuery):
@@ -1534,9 +2220,8 @@ async def cb_ai(call: types.CallbackQuery):
         f"🧠 <b>Анализ ИИ:</b>\n\n{res}",
         parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="« К боту", callback_data=f"bot:{bid}")]
-        ])
-    )
+            [InlineKeyboardButton(text="« К боту", callback_data=f"bot:{bid}")]]))
+
 
 @dp.callback_query(F.data.startswith("logs:"))
 async def cb_logs(call: types.CallbackQuery, state: FSMContext = None):
@@ -1559,6 +2244,7 @@ async def cb_logs(call: types.CallbackQuery, state: FSMContext = None):
     except Exception:
         await call.message.answer(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=kb), parse_mode="HTML")
 
+
 @dp.callback_query(F.data.startswith("downlog:"))
 async def cb_downlog(call: types.CallbackQuery):
     bid = int(call.data.split(":")[1])
@@ -1568,6 +2254,7 @@ async def cb_downlog(call: types.CallbackQuery):
         await call.answer()
     else:
         await call.answer("Лог пуст", show_alert=True)
+
 
 @dp.callback_query(F.data.startswith("files:"))
 async def cb_files(call: types.CallbackQuery, state: FSMContext = None):
@@ -1583,14 +2270,12 @@ async def cb_files(call: types.CallbackQuery, state: FSMContext = None):
             f"📁 <b>Файлы #{bid}</b>\n\n📭 Пусто",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[
                 [InlineKeyboardButton(text="➕ Добавить", callback_data=f"addfile:{bid}")],
-                [InlineKeyboardButton(text="« К боту", callback_data=f"bot:{bid}")]
-            ]),
-            parse_mode="HTML"
-        )
+                [InlineKeyboardButton(text="« К боту", callback_data=f"bot:{bid}")]]),
+            parse_mode="HTML")
     text = f"📁 <b>Файлы #{bid}</b> ({len(files)})\n\n"
     kb = []
     for i, (fn, sz) in enumerate(files[:15]):
-        text += f"• <code>{html.escape(fn)}</code> ({sz/1024:.1f} KB)\n"
+        text += f"• <code>{html.escape(fn)}</code> ({sz / 1024:.1f} KB)\n"
         kb.append([
             InlineKeyboardButton(text=f"⬇️ {fn[:18]}", callback_data=f"getf:{bid}:{i}"),
             InlineKeyboardButton(text="🗑", callback_data=f"delf:{bid}:{i}")
@@ -1598,6 +2283,7 @@ async def cb_files(call: types.CallbackQuery, state: FSMContext = None):
     kb.append([InlineKeyboardButton(text="➕ Добавить", callback_data=f"addfile:{bid}")])
     kb.append([InlineKeyboardButton(text="« К боту", callback_data=f"bot:{bid}")])
     await call.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=kb), parse_mode="HTML")
+
 
 @dp.callback_query(F.data.startswith("addfile:"))
 async def cb_addfile(call: types.CallbackQuery, state: FSMContext):
@@ -1610,10 +2296,9 @@ async def cb_addfile(call: types.CallbackQuery, state: FSMContext):
     await call.message.edit_text(
         f"➕ <b>Файл для бота #{bid}</b>\n\nОтправь .py / .zip или /cancel",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="« Отмена", callback_data=f"bot:{bid}")]
-        ]),
-        parse_mode="HTML"
-    )
+            [InlineKeyboardButton(text="« Отмена", callback_data=f"bot:{bid}")]]),
+        parse_mode="HTML")
+
 
 @dp.callback_query(F.data.startswith("getf:"))
 async def cb_getf(call: types.CallbackQuery):
@@ -1625,6 +2310,7 @@ async def cb_getf(call: types.CallbackQuery):
         if fp.exists():
             await call.message.answer_document(FSInputFile(str(fp)))
     await call.answer()
+
 
 @dp.callback_query(F.data.startswith("delf:"))
 async def cb_delf(call: types.CallbackQuery):
@@ -1641,6 +2327,7 @@ async def cb_delf(call: types.CallbackQuery):
     else:
         await call.answer("Не найдено", show_alert=True)
 
+
 @dp.callback_query(F.data.startswith("del:"))
 async def cb_delbot(call: types.CallbackQuery):
     bid = int(call.data.split(":")[1])
@@ -1652,8 +2339,11 @@ async def cb_delbot(call: types.CallbackQuery):
     if bd.exists():
         shutil.rmtree(bd, ignore_errors=True)
     delete_bot_record(bid)
-    await call.answer("🗑 Удалён")
+    lim = get_limits(b[1])
+    free_line = "" if lim["unlimited"] else f"\n♻️ Слот свободен: {len(get_user_bots(b[1]))}/{lim['slots'] or 0}"
+    await call.answer(f"🗑 Удалён{free_line}", show_alert=False)
     await cb_mybots(call)
+
 
 # ═══════════════════════════════════════════════════════════════
 # 👑 АДМИНКА
@@ -1670,7 +2360,8 @@ async def cb_admin(call: types.CallbackQuery, state: FSMContext = None):
     text = (
         f"👑 <b>Панель управления</b>\n\n"
         f"👥 {s['users']} | 🚫 {s['banned']} | 🛡 {s['admins']}\n"
-        f"💳 Слотов: {s['slots']}\n"
+        f"🧩 Слотов: {s['slots']} | 🚀 Хостингов: {s['hosts']}\n"
+        f"🔔 Истекают ≤{NOTIFY_BEFORE_DAYS:g} дн.: {s['soon']}\n"
         f"🤖 Ботов: {s['bots']} (🟢 {s['running']} | 🧊 {s['frozen']})\n"
         f"💰 Заявок: {s['pending']}\n"
         f"⏱ {get_uptime()}"
@@ -1678,6 +2369,8 @@ async def cb_admin(call: types.CallbackQuery, state: FSMContext = None):
     kb = [
         [InlineKeyboardButton(text=pay_btn, callback_data="adm_payments"),
          InlineKeyboardButton(text="🎁 Промокоды", callback_data="adm_promos")],
+        [InlineKeyboardButton(text="📦 Подписки", callback_data="adm_subs"),
+         InlineKeyboardButton(text="🎁 Выдать подписку", callback_data="adm_grant")],
         [InlineKeyboardButton(text="🤖 Все боты", callback_data="adm_allbots"),
          InlineKeyboardButton(text="🔍 Поиск бота", callback_data="adm_searchbot")],
         [InlineKeyboardButton(text="✉️ ЛС юзеру", callback_data="adm_msguser"),
@@ -1692,6 +2385,169 @@ async def cb_admin(call: types.CallbackQuery, state: FSMContext = None):
         [InlineKeyboardButton(text="« Меню", callback_data="back_main")]
     ]
     await call.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=kb), parse_mode="HTML")
+
+
+# ─────────────── ПОДПИСКИ В АДМИНКЕ ───────────────
+
+@dp.callback_query(F.data == "adm_subs")
+async def cb_adm_subs(call: types.CallbackQuery):
+    if not is_admin(call.from_user.id):
+        return
+    rows = _db_read(lambda conn: conn.execute(
+        f"SELECT {SUB_COLS} FROM subscriptions WHERE expires_at > ? ORDER BY expires_at ASC LIMIT 40",
+        (datetime.now().isoformat(),)).fetchall())
+    if not rows:
+        return await call.message.edit_text(
+            "📦 Активных подписок нет",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="🎁 Выдать подписку", callback_data="adm_grant")],
+                [InlineKeyboardButton(text="« Админка", callback_data="admin")]]))
+    text = f"📦 <b>Активные подписки ({len(rows)})</b>\n\n"
+    kb = []
+    for s in rows[:30]:
+        p = PLANS.get(s[3], {})
+        emoji = KINDS.get(s[2], {}).get("emoji", "•")
+        text += f"{emoji} <code>{s[1]}</code> · {p.get('name', s[3])} · {human_left(s[4])}\n"
+        kb.append([InlineKeyboardButton(text=f"{emoji} {s[1]} · {human_left(s[4])}", callback_data=f"adm_sub:{s[0]}")])
+    kb.append([InlineKeyboardButton(text="🎁 Выдать подписку", callback_data="adm_grant")])
+    kb.append([InlineKeyboardButton(text="« Админка", callback_data="admin")])
+    await call.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=kb), parse_mode="HTML")
+
+
+@dp.callback_query(F.data.startswith("adm_sub:"))
+async def cb_adm_sub(call: types.CallbackQuery):
+    if not is_admin(call.from_user.id):
+        return
+    sub_id = int(call.data.split(":")[1])
+    s = _db_read(lambda conn: conn.execute(f"SELECT {SUB_COLS} FROM subscriptions WHERE id=?", (sub_id,)).fetchone())
+    if not s:
+        return await call.answer("Подписка не найдена", show_alert=True)
+    p = PLANS.get(s[3], {})
+    u = get_user(s[1])
+    text = (
+        f"📦 <b>Подписка #{s[0]}</b>\n\n"
+        f"👤 <code>{s[1]}</code> @{u[1] if u and u[1] else '—'}\n"
+        f"{KINDS.get(s[2], {}).get('emoji', '•')} {KINDS.get(s[2], {}).get('name', s[2])}\n"
+        f"{p.get('emoji', '')} Тариф: <b>{p.get('name', s[3])}</b>\n"
+        f"⏳ Осталось: <b>{human_left(s[4])}</b> (до {fmt_dt(datetime.fromisoformat(s[4]))})\n"
+        f"🤖 Ботов у юзера: <b>{len(get_user_bots(s[1]))}</b>"
+    )
+    kb = [
+        [InlineKeyboardButton(text="➕ Продлить на 7 дней", callback_data=f"adm_sub_add:{s[0]}:7"),
+         InlineKeyboardButton(text="➕ Продлить на 30 дней", callback_data=f"adm_sub_add:{s[0]}:30")],
+        [InlineKeyboardButton(text="❌ Отозвать", callback_data=f"adm_sub_del:{s[0]}")],
+        [InlineKeyboardButton(text="« К подпискам", callback_data="adm_subs")]
+    ]
+    await call.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=kb), parse_mode="HTML")
+
+
+@dp.callback_query(F.data.startswith("adm_sub_add:"))
+async def cb_adm_sub_add(call: types.CallbackQuery):
+    if not is_admin(call.from_user.id):
+        return
+    _, sid_s, days_s = call.data.split(":")
+    sub_id, days = int(sid_s), int(days_s)
+    s = _db_read(lambda conn: conn.execute(f"SELECT {SUB_COLS} FROM subscriptions WHERE id=?", (sub_id,)).fetchone())
+    if not s:
+        return await call.answer("Подписка не найдена", show_alert=True)
+    base = max(datetime.fromisoformat(s[4]), datetime.now())
+    new_exp = base + timedelta(days=days)
+    _db_retry(lambda conn: conn.execute(
+        "UPDATE subscriptions SET expires_at=?, reminded_3d=0, reminded_1d=0, expired_notified=0 WHERE id=?",
+        (new_exp.isoformat(), sub_id)))
+    await call.answer(f"✅ +{days} дн. → {fmt_dt(new_exp)}", show_alert=True)
+    try:
+        await bot.send_message(s[1], f"🎁 <b>Администратор продлил подписку на {days} дн.</b>\n\n⏳ Теперь до: <b>{fmt_dt(new_exp)}</b>",
+                               parse_mode="HTML", reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                                   [InlineKeyboardButton(text="📦 Моя подписка", callback_data="myslots")]]))
+    except Exception:
+        pass
+    await cb_adm_sub(call)
+
+
+@dp.callback_query(F.data.startswith("adm_sub_del:"))
+async def cb_adm_sub_del(call: types.CallbackQuery):
+    if not is_admin(call.from_user.id):
+        return
+    sub_id = int(call.data.split(":")[1])
+    s = _db_read(lambda conn: conn.execute(f"SELECT {SUB_COLS} FROM subscriptions WHERE id=?", (sub_id,)).fetchone())
+    if s:
+        _db_retry(lambda conn: conn.execute("DELETE FROM subscriptions WHERE id=?", (sub_id,)))
+        try:
+            await bot.send_message(s[1], "❌ <b>Подписка отозвана администратором.</b>", parse_mode="HTML")
+        except Exception:
+            pass
+    await call.answer("Отозвана")
+    await cb_adm_subs(call)
+
+
+@dp.callback_query(F.data == "adm_grant")
+async def cb_adm_grant(call: types.CallbackQuery, state: FSMContext):
+    if not is_admin(call.from_user.id):
+        return
+    await state.set_state(AdminStates.grant_uid)
+    await call.message.edit_text(
+        "🎁 <b>Выдача подписки</b>\n\nОтправь ID или @username получателя:",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="« Отмена", callback_data="admin")]]))
+
+
+@dp.message(AdminStates.grant_uid)
+async def adm_grant_uid(message: types.Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        return
+    txt = (message.text or "").strip()
+    uid = find_user_by_username(txt) if txt.startswith("@") else (int(txt) if txt.isdigit() else None)
+    if not uid:
+        return await message.answer("❌ Не нашёл пользователя. Отправь числовой ID или @username.")
+    await state.update_data(grant_uid=uid)
+    await state.set_state(AdminStates.grant_plan)
+    rows = []
+    for kind in ("bot", "host"):
+        for pid, p in plans_of_kind(kind):
+            rows.append([InlineKeyboardButton(text=f"{p['emoji']} {p['name']} · {p['days']} дн.", callback_data=f"adm_grant_plan:{pid}")])
+    rows.append([InlineKeyboardButton(text="« Отмена", callback_data="admin")])
+    await message.answer(f"👤 Получатель: <code>{uid}</code>\n\nВыбери тариф:", reply_markup=InlineKeyboardMarkup(inline_keyboard=rows), parse_mode="HTML")
+
+
+@dp.callback_query(F.data.startswith("adm_grant_plan:"))
+async def cb_adm_grant_plan(call: types.CallbackQuery, state: FSMContext):
+    if not is_admin(call.from_user.id):
+        return
+    parts = call.data.split(":")
+    pid = parts[1] if len(parts) > 1 else ""
+    mode = parts[2] if len(parts) > 2 else ""
+    data = await state.get_data()
+    uid = data.get("grant_uid")
+    if not uid:
+        return await call.answer("Сессия истекла, начни заново", show_alert=True)
+    if pid not in PLANS:
+        return await call.answer("Тариф недоступен", show_alert=True)
+    p = PLANS[pid]
+
+    # Для слотов спрашиваем: продлить срок или выдать дополнительный слот.
+    if not mode and p["kind"] == "bot" and has_sub_of_kind(uid, "bot"):
+        await state.update_data(grant_uid=uid)
+        return await call.message.edit_text(
+            f"👤 <code>{uid}</code> · {p['emoji']} <b>{p['name']}</b>\n\nЧто выдать?",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="♻️ Продлить текущий срок", callback_data=f"adm_grant_plan:{pid}:extend")],
+                [InlineKeyboardButton(text="➕ Дополнительный слот", callback_data=f"adm_grant_plan:{pid}:new")],
+                [InlineKeyboardButton(text="« Отмена", callback_data="admin")]]),
+            parse_mode="HTML")
+    mode = mode or "extend"
+    await state.clear()
+    res = add_subscription(uid, pid, mode=mode)
+    await send_sub_activated(uid, pid, res)
+    await call.message.edit_text(
+        f"✅ Выдано: <code>{uid}</code> · {PLANS[pid]['name']}"
+        f" ({'продление' if res['extended'] else ('новый слот' if mode == 'new' else 'подписка')}) до <b>{fmt_dt(res['expires_at'])}</b>",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="« Админка", callback_data="admin")]]),
+        parse_mode="HTML")
+
+
+# ─────────────── ОСТАЛЬНАЯ АДМИНКА ───────────────
 
 @dp.callback_query(F.data == "adm_cleanup")
 async def cb_adm_cleanup(call: types.CallbackQuery):
@@ -1719,10 +2575,11 @@ async def cb_adm_cleanup(call: types.CallbackQuery):
             del_db += 1
     conn.commit()
     conn.close()
+    removed = cleanup_subscriptions(60)
     await call.message.answer(
-        f"✅ Очистка:\nПапок: {del_folders}\nЗаписей БД: {del_db}",
-        parse_mode="HTML"
-    )
+        f"✅ Очистка:\nПапок: {del_folders}\nЗаписей БД: {del_db}\nСтарых подписок: {removed}",
+        parse_mode="HTML")
+
 
 @dp.callback_query(F.data == "adm_searchbot")
 async def cb_adm_searchbot(call: types.CallbackQuery, state: FSMContext):
@@ -1732,9 +2589,8 @@ async def cb_adm_searchbot(call: types.CallbackQuery, state: FSMContext):
     await call.message.edit_text(
         "🔍 Введи ID бота:",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="« Назад", callback_data="admin")]
-        ])
-    )
+            [InlineKeyboardButton(text="« Назад", callback_data="admin")]]))
+
 
 @dp.message(AdminStates.search_bot)
 async def adm_searchbot_do(message: types.Message, state: FSMContext):
@@ -1744,14 +2600,16 @@ async def adm_searchbot_do(message: types.Message, state: FSMContext):
     if not get_bot(bid):
         return await message.answer("❌ Бот не найден")
     await state.clear()
-    # эмулируем callback bot:ID
+
     class FC:
         def __init__(self):
             self.message = message
             self.data = f"bot:{bid}"
             self.from_user = message.from_user
             self.answer = lambda *a, **k: asyncio.sleep(0)
+
     await cb_bot_detail(FC(), None)
+
 
 @dp.callback_query(F.data == "adm_payments")
 async def cb_adm_payments(call: types.CallbackQuery):
@@ -1762,20 +2620,19 @@ async def cb_adm_payments(call: types.CallbackQuery):
         return await call.message.edit_text(
             "💰 Нет заявок",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="« Админка", callback_data="admin")]
-            ])
-        )
+                [InlineKeyboardButton(text="« Админка", callback_data="admin")]]))
     text = f"💰 <b>Заявки ({len(reqs)})</b>\n\n"
     kb = []
     for r in reqs:
         p = PLANS.get(r[4], {})
-        text += f"#{r[0]} @{r[2] or '—'} <code>{r[1]}</code> — {p.get('name', r[4])}\n"
+        text += f"#{r[0]} @{r[2] or '—'} <code>{r[1]}</code> — {p.get('name', r[4])} ({p.get('days', '?')} дн.)\n"
         kb.append([
             InlineKeyboardButton(text=f"✅ #{r[0]}", callback_data=f"approve:{r[0]}"),
             InlineKeyboardButton(text=f"❌ #{r[0]}", callback_data=f"reject:{r[0]}")
         ])
     kb.append([InlineKeyboardButton(text="« Админка", callback_data="admin")])
     await call.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=kb), parse_mode="HTML")
+
 
 @dp.callback_query(F.data.startswith("approve:"))
 async def cb_approve(call: types.CallbackQuery):
@@ -1785,25 +2642,18 @@ async def cb_approve(call: types.CallbackQuery):
     req = get_payment_request(rid)
     if not req or req[5] != "pending":
         return await call.answer("Уже обработано", show_alert=True)
+    if req[4] not in PLANS:
+        return await call.answer("Неизвестный тариф в заявке", show_alert=True)
     approve_payment(rid)
-    create_slot(req[1], req[4])
+    mode = (req[8] if len(req) > 8 and req[8] else "extend")
+    res = add_subscription(req[1], req[4], mode=mode)
     await call.message.edit_text(
-        f"✅ Заявка #{rid} одобрена",
+        f"✅ Заявка #{rid} одобрена\n\n{PLANS[req[4]]['name']} ({'продление' if mode != 'new' else 'новый слот'}) → до <b>{fmt_dt(res['expires_at'])}</b>",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="« К заявкам", callback_data="adm_payments")]
-        ])
-    )
-    try:
-        await bot.send_message(
-            req[1],
-            "🎉 <b>Оплата подтверждена!</b> Можно загружать бота.",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="📤 Загрузить", callback_data="upload")]
-            ]),
-            parse_mode="HTML"
-        )
-    except Exception:
-        pass
+            [InlineKeyboardButton(text="« К заявкам", callback_data="adm_payments")]]),
+        parse_mode="HTML")
+    await send_sub_activated(req[1], req[4], res)
+
 
 @dp.callback_query(F.data.startswith("reject:"))
 async def cb_reject(call: types.CallbackQuery):
@@ -1817,13 +2667,12 @@ async def cb_reject(call: types.CallbackQuery):
     await call.message.edit_text(
         f"❌ Заявка #{rid} отклонена",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="« К заявкам", callback_data="adm_payments")]
-        ])
-    )
+            [InlineKeyboardButton(text="« К заявкам", callback_data="adm_payments")]]))
     try:
         await bot.send_message(req[1], "❌ Заявка отклонена. Напиши владельцу, если ошибка.", parse_mode="HTML")
     except Exception:
         pass
+
 
 @dp.callback_query(F.data == "adm_promos")
 async def cb_adm_promos(call: types.CallbackQuery):
@@ -1836,10 +2685,12 @@ async def cb_adm_promos(call: types.CallbackQuery):
         text += "Пусто"
     else:
         for p in promos:
-            text += f"• <code>{p[1]}</code> — {PLANS.get(p[2], {}).get('name', p[2])} (×{p[3]})\n"
+            pname = PLANS.get(p[2], {}).get("name", p[2])
+            text += f"• <code>{p[1]}</code> — {pname} (×{p[3]})\n"
             kb.append([InlineKeyboardButton(text=f"❌ {p[1]}", callback_data=f"adm_promo_del:{p[0]}")])
     kb.append([InlineKeyboardButton(text="« Админка", callback_data="admin")])
     await call.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=kb), parse_mode="HTML")
+
 
 @dp.callback_query(F.data == "adm_promo_add")
 async def cb_adm_promo_add(call: types.CallbackQuery, state: FSMContext):
@@ -1848,46 +2699,60 @@ async def cb_adm_promo_add(call: types.CallbackQuery, state: FSMContext):
     await state.set_state(AdminStates.promo_code)
     await call.message.edit_text("🎟 Отправь код промокода (латиница):")
 
+
 @dp.message(AdminStates.promo_code)
 async def adm_promo_code(message: types.Message, state: FSMContext):
     code = (message.text or "").strip().upper()
+    if not re.fullmatch(r"[A-Z0-9_\-]{3,32}", code):
+        return await message.answer("❌ Только латиница/цифры, 3–32 символа.")
     await state.update_data(code=code)
-    await message.answer(
-        f"Код: <code>{code}</code>\nТариф:",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="📅 Неделя", callback_data="adm_plan:week")],
-            [InlineKeyboardButton(text="🗓 2 недели", callback_data="adm_plan:2weeks")],
-            [InlineKeyboardButton(text="💎 Месяц", callback_data="adm_plan:month")]
-        ]),
-        parse_mode="HTML"
-    )
+    await state.set_state(AdminStates.promo_plan)
+    rows = []
+    for kind in ("bot", "host"):
+        for pid, p in plans_of_kind(kind):
+            rows.append([InlineKeyboardButton(text=f"{p['emoji']} {p['name']} · {p['days']} дн.", callback_data=f"adm_promo_plan:{pid}")])
+    await message.answer(f"Код: <code>{code}</code>\nТариф:", reply_markup=InlineKeyboardMarkup(inline_keyboard=rows), parse_mode="HTML")
 
-@dp.callback_query(F.data.startswith("adm_plan:"))
+
+@dp.callback_query(F.data.startswith("adm_promo_plan:"))
 async def adm_promo_plan(call: types.CallbackQuery, state: FSMContext):
-    await state.update_data(plan=call.data.split(":")[1])
+    if not is_admin(call.from_user.id):
+        return
+    pid = call.data.split(":", 1)[1]
+    if pid not in PLANS:
+        return await call.answer("Тариф недоступен", show_alert=True)
+    await state.update_data(plan=pid)
     await state.set_state(AdminStates.promo_uses)
-    await call.message.edit_text("Количество активаций (число):")
+    await call.message.edit_text(f"Тариф: <b>{PLANS[pid]['name']}</b>\n\nКоличество активаций (число):", parse_mode="HTML")
+
 
 @dp.message(AdminStates.promo_uses)
 async def adm_promo_uses(message: types.Message, state: FSMContext):
     if not (message.text or "").isdigit():
         return await message.answer("❌ Число!")
     data = await state.get_data()
-    create_promo(data["code"], data["plan"], int(message.text))
-    await message.answer(
-        f"✅ <code>{data['code']}</code> создан!",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="« К промокодам", callback_data="adm_promos")]
-        ]),
-        parse_mode="HTML"
-    )
+    uses = int(message.text)
+    if uses <= 0:
+        return await message.answer("❌ Число должно быть больше нуля.")
+    if create_promo(data["code"], data["plan"], uses):
+        await message.answer(
+            f"✅ <code>{data['code']}</code> создан!\n{PLANS[data['plan']]['name']} × {uses}",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="« К промокодам", callback_data="adm_promos")]]),
+            parse_mode="HTML")
+    else:
+        await message.answer("❌ Такой код уже существует.")
     await state.clear()
+
 
 @dp.callback_query(F.data.startswith("adm_promo_del:"))
 async def cb_adm_promo_del(call: types.CallbackQuery):
+    if not is_admin(call.from_user.id):
+        return
     delete_promo(int(call.data.split(":")[1]))
     await call.answer("🗑")
     await cb_adm_promos(call)
+
 
 @dp.callback_query(F.data == "adm_allbots")
 async def cb_adm_allbots(call: types.CallbackQuery):
@@ -1899,14 +2764,13 @@ async def cb_adm_allbots(call: types.CallbackQuery):
         st = "🟢" if b[0] in running_bots else ("🧊" if b[6] else "🔴")
         kb.append([InlineKeyboardButton(
             text=f"{st} #{b[0]} u:{b[1]} {(b[2] or '')[:12]}",
-            callback_data=f"bot:{b[0]}"
-        )])
+            callback_data=f"bot:{b[0]}")])
     kb.append([InlineKeyboardButton(text="« Админка", callback_data="admin")])
     await call.message.edit_text(
         "🤖 <b>Все боты (God Mode)</b>",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=kb),
-        parse_mode="HTML"
-    )
+        parse_mode="HTML")
+
 
 @dp.callback_query(F.data.startswith("adm_viewuser_id:"))
 async def cb_adm_viewuser_id(call: types.CallbackQuery):
@@ -1916,18 +2780,30 @@ async def cb_adm_viewuser_id(call: types.CallbackQuery):
     u = get_user(uid)
     if not u:
         return await call.answer("Не найден", show_alert=True)
+    lim = get_limits(uid)
+    subs = lim["subs"]
+    subs_line = "нет активных"
+    if is_admin(uid):
+        subs_line = "👑 админ (безлимит)"
+    elif subs:
+        subs_line = ", ".join(f"{PLANS.get(s[3], {}).get('name', s[3])} ({human_left(s[4])})" for s in subs)
     text = (
         f"👤 <b>Юзер</b>\nID: <code>{u[0]}</code>\n@{u[1] or '—'}\n"
-        f"Бан: {'Да' if u[4] else 'Нет'}\nБотов: {len(get_user_bots(uid))}"
+        f"Бан: {'Да' if u[4] else 'Нет'}\nБотов: {len(get_user_bots(uid))}\n"
+        f"📦 Подписки: {subs_line}"
     )
-    kb = [[InlineKeyboardButton(
-        text="🚫 Бан" if not u[4] else "✅ Разбан",
-        callback_data=f"adm_act_toggleban:{u[0]}"
-    )], [InlineKeyboardButton(text="« Админка", callback_data="admin")]]
+    kb = [
+        [InlineKeyboardButton(text="📦 Выдать подписку", callback_data="adm_grant")],
+        [InlineKeyboardButton(text="🚫 Бан" if not u[4] else "✅ Разбан", callback_data=f"adm_act_toggleban:{u[0]}")],
+        [InlineKeyboardButton(text="« Админка", callback_data="admin")]
+    ]
     await call.message.answer(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=kb), parse_mode="HTML")
+
 
 @dp.callback_query(F.data.startswith("adm_act_toggleban:"))
 async def cb_adm_toggleban(call: types.CallbackQuery):
+    if not is_admin(call.from_user.id):
+        return
     uid = int(call.data.split(":")[1])
     u = get_user(uid)
     if not u:
@@ -1941,6 +2817,7 @@ async def cb_adm_toggleban(call: types.CallbackQuery):
     await call.answer("Готово")
     await cb_admin(call, None)
 
+
 @dp.callback_query(F.data == "adm_msguser")
 async def cb_adm_msguser(call: types.CallbackQuery, state: FSMContext):
     if not is_admin(call.from_user.id):
@@ -1948,8 +2825,11 @@ async def cb_adm_msguser(call: types.CallbackQuery, state: FSMContext):
     await state.set_state(AdminStates.msg_uid)
     await call.message.edit_text("✉️ ID или @username:")
 
+
 @dp.message(AdminStates.msg_uid)
 async def adm_msg_uid(message: types.Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        return
     txt = (message.text or "").strip()
     uid = find_user_by_username(txt) if txt.startswith("@") else (int(txt) if txt.isdigit() else None)
     if not uid:
@@ -1958,8 +2838,11 @@ async def adm_msg_uid(message: types.Message, state: FSMContext):
     await state.set_state(AdminStates.msg_text)
     await message.answer(f"Текст для <code>{uid}</code>:", parse_mode="HTML")
 
+
 @dp.message(AdminStates.msg_text)
 async def adm_msg_send(message: types.Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        return
     uid = (await state.get_data())["target_uid"]
     await state.clear()
     try:
@@ -1967,6 +2850,7 @@ async def adm_msg_send(message: types.Message, state: FSMContext):
         await message.answer("✅ Отправлено")
     except Exception as e:
         await message.answer(f"❌ {e}")
+
 
 @dp.callback_query(F.data == "adm_broadcast")
 async def cb_adm_broadcast(call: types.CallbackQuery, state: FSMContext):
@@ -1979,45 +2863,43 @@ async def cb_adm_broadcast(call: types.CallbackQuery, state: FSMContext):
         "Поддерживается: текст, 🖼 фото, 🎥 видео, 🎵 аудио, 🎙 голос, 📄 документы, GIF/анимации и стикеры.\n"
         "Сохраняются HTML/Markdown-подобное форматирование Telegram, эмодзи, подпись к медиа и entities.\n\n"
         "❌ /cancel — отмена",
-        parse_mode="HTML"
-    )
+        parse_mode="HTML")
+
 
 @dp.message(AdminStates.broadcast)
 async def adm_broadcast_send(message: types.Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        return
     await state.clear()
     users = get_all_users()
     st = await message.answer(f"⏳ <b>Начинаю рассылку</b>\nПолучателей: {len(users)}", parse_mode="HTML")
     ok = 0
     failed = 0
-
-    # copy_to/copy_message переносит сам тип сообщения и его Telegram entities:
-    # текст, caption, форматирование, фото, видео, документ, аудио, GIF и т.д.
-    # В отличие от send_message нам не нужно вручную разбирать каждый тип медиа.
     for u in users:
         try:
             await message.copy_to(chat_id=u[0])
             ok += 1
-            # Безопасный темп, чтобы не упираться в лимиты Telegram.
             await asyncio.sleep(0.06)
         except Exception as e:
             failed += 1
             logger.warning("broadcast to %s failed: %s", u[0], e)
-
     await st.edit_text(
-        f"✅ <b>Рассылка завершена</b>\n\n"
-        f"📨 Доставлено: <b>{ok}</b>\n"
-        f"❌ Ошибок: <b>{failed}</b>\n"
-        f"👥 Всего: <b>{len(users)}</b>",
-        parse_mode="HTML"
-    )
+        f"✅ <b>Рассылка завершена</b>\n\n📨 Доставлено: <b>{ok}</b>\n❌ Ошибок: <b>{failed}</b>\n👥 Всего: <b>{len(users)}</b>",
+        parse_mode="HTML")
+
 
 @dp.callback_query(F.data == "adm_ban")
 async def cb_adm_ban(call: types.CallbackQuery, state: FSMContext):
+    if not is_admin(call.from_user.id):
+        return
     await state.set_state(AdminStates.ban)
     await call.message.edit_text("🚫 ID или @username:")
 
+
 @dp.message(AdminStates.ban)
 async def adm_ban_do(message: types.Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        return
     txt = (message.text or "").strip()
     uid = find_user_by_username(txt) if txt.startswith("@") else (int(txt) if txt.isdigit() else None)
     await state.clear()
@@ -2028,19 +2910,26 @@ async def adm_ban_do(message: types.Message, state: FSMContext):
         await stop_user_bot(b[0])
     await message.answer(f"🚫 <code>{uid}</code> забанен", parse_mode="HTML")
 
+
 @dp.callback_query(F.data == "adm_unban")
 async def cb_adm_unban(call: types.CallbackQuery, state: FSMContext):
+    if not is_admin(call.from_user.id):
+        return
     await state.set_state(AdminStates.unban)
     await call.message.edit_text("✅ ID для разбана:")
 
+
 @dp.message(AdminStates.unban)
 async def adm_unban_do(message: types.Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        return
     await state.clear()
     if (message.text or "").isdigit():
         unban_user(int(message.text))
         await message.answer("✅ Разбанен")
     else:
         await message.answer("❌ ID")
+
 
 @dp.callback_query(F.data == "adm_addadmin")
 async def cb_adm_addadmin(call: types.CallbackQuery, state: FSMContext):
@@ -2049,14 +2938,18 @@ async def cb_adm_addadmin(call: types.CallbackQuery, state: FSMContext):
     await state.set_state(AdminStates.addadmin)
     await call.message.edit_text("🛡 ID нового админа:")
 
+
 @dp.message(AdminStates.addadmin)
 async def adm_addadmin_do(message: types.Message, state: FSMContext):
+    if message.from_user.id != OWNER_ID:
+        return
     await state.clear()
     if (message.text or "").isdigit():
         add_admin(int(message.text))
         await message.answer("🛡 Добавлен")
     else:
         await message.answer("❌")
+
 
 @dp.callback_query(F.data == "adm_remadmin")
 async def cb_adm_remadmin(call: types.CallbackQuery):
@@ -2067,11 +2960,15 @@ async def cb_adm_remadmin(call: types.CallbackQuery):
     kb.append([InlineKeyboardButton(text="« Отмена", callback_data="admin")])
     await call.message.edit_text("Удалить админа:", reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
 
+
 @dp.callback_query(F.data.startswith("remadm:"))
 async def cb_remadm_do(call: types.CallbackQuery):
+    if call.from_user.id != OWNER_ID:
+        return
     remove_admin(int(call.data.split(":")[1]))
     await call.answer("Удалён")
     await cb_admin(call, None)
+
 
 @dp.callback_query(F.data == "adm_backup")
 async def cb_adm_backup(call: types.CallbackQuery):
@@ -2079,11 +2976,11 @@ async def cb_adm_backup(call: types.CallbackQuery):
         return await call.answer("Только владелец", show_alert=True)
     if DB_PATH.exists():
         await call.message.answer_document(
-            FSInputFile(str(DB_PATH), filename=f"backup_{datetime.now().strftime('%Y%m%d_%H%M')}.db")
-        )
+            FSInputFile(str(DB_PATH), filename=f"backup_{datetime.now().strftime('%Y%m%d_%H%M')}.db"))
         await call.answer("✅")
     else:
         await call.answer("БД нет", show_alert=True)
+
 
 @dp.callback_query(F.data == "adm_restart_all")
 async def cb_restart_all(call: types.CallbackQuery):
@@ -2094,13 +2991,14 @@ async def cb_restart_all(call: types.CallbackQuery):
         await stop_user_bot(bid)
     n = 0
     for b in get_all_bots():
-        if b[6] == 0 and not is_user_banned(b[1]):
+        if b[6] == 0 and not is_user_banned(b[1]) and has_active_slot(b[1]):
             if await start_user_bot(b[0]):
                 n += 1
     await call.message.answer(f"🔄 Перезапущено: {n}")
 
+
 # ═══════════════════════════════════════════════════════════════
-# 🎯 MAIN — С УДАЛЕНИЕМ WEBHOOK (ФИКС CONFLICT)
+# 🎯 MAIN
 # ═══════════════════════════════════════════════════════════════
 
 async def main():
@@ -2111,14 +3009,17 @@ async def main():
         logger.warning("SYNC_SECRET не задан — автоматическая выдача через кассира отключена.")
     acquire_instance_lock()
     logger.info("=" * 50)
-    logger.info("🤖 BotHost запускается | pid=%s | db=%s", os.getpid(), DB_PATH)
+    logger.info("🤖 BotHost v9.0 | pid=%s | db=%s", os.getpid(), DB_PATH)
     logger.info(f"👤 Владелец: {OWNER_ID}")
     logger.info(f"🔗 Кассир: @{VERIFIER_BOT_USERNAME}")
     logger.info(f"📢 SYNC канал: {SYNC_CHANNEL_ID}")
     logger.info(f"📦 FILE STORAGE канал: {FILE_STORAGE_CHANNEL_ID or 'не задан'}")
+    logger.info(f"⏳ Льготный период: {GRACE_HOURS} ч | напоминания за {NOTIFY_BEFORE_DAYS:g} дн.")
     logger.info("=" * 50)
+    if str(DATA_DIR).startswith("/app") and os.name == "posix":
+        logger.info("💡 Важно: подключи Railway Volume на %s — иначе подписки и боты исчезнут при редеплое.", DATA_DIR)
 
-    # ГЛАВНЫЙ ФИКС: сброс webhook, иначе Conflict forever
+    # Сброс webhook, иначе Conflict forever
     try:
         await bot.delete_webhook(drop_pending_updates=True)
         logger.info("✅ Webhook удалён, polling готов")
@@ -2129,14 +3030,13 @@ async def main():
     await restore_running_bots()
     asyncio.create_task(monitor_bots())
     asyncio.create_task(auto_backup())
+    asyncio.create_task(monitor_subscriptions())
 
     # Внутренний кассир работает в ЭТОМ ЖЕ Railway-сервисе, но использует
-    # отдельный Telegram token и отдельный Dispatcher. Его нельзя запускать
-    # как пользовательского bot_XX.
+    # отдельный Telegram token и отдельный Dispatcher.
     cashier_task = None
     if os.environ.get("CASHIER_TOKEN", "").strip():
         async def run_internal_cashier():
-            # Кассир никогда не должен иметь возможность уронить основной BotHost.
             while True:
                 try:
                     cashier = importlib.import_module("cashier")
@@ -2148,13 +3048,12 @@ async def main():
                 except Exception:
                     logger.exception("❌ Внутренний кассир остановился; перезапуск через 5 сек")
                 await asyncio.sleep(5)
+
         cashier_task = asyncio.create_task(run_internal_cashier(), name="internal-cashier")
     else:
         logger.warning("⚠️ CASHIER_TOKEN не задан — внутренний кассир отключён")
 
     try:
-        # Ошибки сети Telegram не должны завершать основной процесс Railway.
-        # Conflict/Unauthorized считаем фатальными: они означают неверную конфигурацию.
         while True:
             try:
                 await dp.start_polling(bot, allowed_updates=["message", "callback_query", "channel_post"])
@@ -2178,6 +3077,7 @@ async def main():
                 await cashier_task
             except asyncio.CancelledError:
                 pass
+
 
 if __name__ == "__main__":
     try:
