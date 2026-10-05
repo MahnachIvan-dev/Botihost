@@ -28,6 +28,14 @@
    • Если бот остановлен из-за истёкшей подписки — придёт уведомление
      с кнопками продления, а файлы и переменные останутся на месте.
 
+✅ Для владельца:
+   • 🎫 «Безлимит-карта» — персональный безлимит на ботов, выдаётся владельцем
+     конкретному пользователю (бессрочно или на срок). НЕ даёт доступ к админке.
+   • 👥 «Пользователи» — постраничный список всех аккаунтов: подписки, число
+     ботов, флаги (бан/админ/безлимит) и карточка юзера со списком его ботов,
+     баном, ЛС, выдачей подписки и безлимита прямо из карточки.
+   • 🔍 Поиск пользователя по ID или @username.
+
 ⚠️ Обязательно подключи Railway Volume на DATA_DIR (/app/data), иначе при
    редеплое вместе с файлами пропадут и подписки. В логе при старте есть подсказка.
 """
@@ -205,6 +213,7 @@ def init_db():
         c.execute("CREATE TABLE IF NOT EXISTS subscriptions (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, kind TEXT NOT NULL DEFAULT 'bot', plan TEXT NOT NULL, expires_at TEXT NOT NULL, period_days INTEGER DEFAULT 0, reminded_3d INTEGER DEFAULT 0, reminded_1d INTEGER DEFAULT 0, expired_notified INTEGER DEFAULT 0, created_at TEXT NOT NULL)")
         c.execute("CREATE INDEX IF NOT EXISTS idx_subs_user ON subscriptions(user_id, expires_at)")
         c.execute("CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT)")
+        c.execute("CREATE TABLE IF NOT EXISTS vip (user_id INTEGER PRIMARY KEY, note TEXT DEFAULT '', granted_by INTEGER, created_at TEXT NOT NULL, expires_at TEXT)")
         c.execute("CREATE TABLE IF NOT EXISTS bots (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, filename TEXT, bot_token TEXT, status TEXT DEFAULT 'stopped', created_at TEXT, is_frozen INTEGER DEFAULT 0, entry_point TEXT DEFAULT 'user_bot.py', auto_restart INTEGER DEFAULT 0, env_vars TEXT DEFAULT '{}')")
         c.execute("CREATE TABLE IF NOT EXISTS payment_requests (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, username TEXT, full_name TEXT, plan TEXT, status TEXT DEFAULT 'pending', created_at TEXT, processed_at TEXT)")
         c.execute("CREATE TABLE IF NOT EXISTS promocodes (id INTEGER PRIMARY KEY AUTOINCREMENT, code TEXT UNIQUE, plan TEXT, uses_left INTEGER, created_at TEXT)")
@@ -312,6 +321,71 @@ def get_all_admins():
 
 
 # ═══════════════════════════════════════════════════════════════
+# 🎫 БЕЗЛИМИТ-КАРТЫ ОТ ВЛАДЕЛЬЦА
+# Персональный безлимит для конкретного пользователя.
+# В отличие от админки НЕ даёт доступ к панели управления.
+# ═══════════════════════════════════════════════════════════════
+
+def get_vip(uid):
+    return _db_read(lambda conn: conn.execute("SELECT * FROM vip WHERE user_id = ?", (uid,)).fetchone())
+
+
+def vip_is_alive(row):
+    """row: (user_id, note, granted_by, created_at, expires_at). expires_at NULL = бессрочно."""
+    if not row:
+        return False
+    exp = row[4]
+    if not exp:
+        return True
+    try:
+        return datetime.fromisoformat(exp) > datetime.now()
+    except Exception:
+        return True
+
+
+def is_vip(uid):
+    return vip_is_alive(get_vip(uid))
+
+
+def grant_vip(uid, days=None, granted_by=None):
+    """Выдать безлимит-карту. days=None → бессрочно. Возвращает дату окончания или None."""
+    now = datetime.now()
+    exp = (now + timedelta(days=days)).isoformat() if days else None
+    def op(conn):
+        conn.execute("INSERT INTO users(user_id, created_at) VALUES(?,?) ON CONFLICT(user_id) DO NOTHING", (uid, now.isoformat()))
+        conn.execute(
+            """INSERT INTO vip(user_id, note, granted_by, created_at, expires_at) VALUES(?,?,?,?,?)
+               ON CONFLICT(user_id) DO UPDATE SET granted_by=excluded.granted_by,
+                                                  created_at=excluded.created_at,
+                                                  expires_at=excluded.expires_at""",
+            (uid, "", granted_by, now.isoformat(), exp))
+    _db_retry(op)
+    return exp
+
+
+def revoke_vip(uid):
+    return _db_retry(lambda conn: conn.execute("DELETE FROM vip WHERE user_id = ?", (uid,)).rowcount)
+
+
+def get_all_vips(active_only=True):
+    def read(conn):
+        if active_only:
+            return conn.execute("SELECT * FROM vip WHERE expires_at IS NULL OR expires_at > ? ORDER BY created_at DESC",
+                                (datetime.now().isoformat(),)).fetchall()
+        return conn.execute("SELECT * FROM vip ORDER BY created_at DESC").fetchall()
+    return _db_read(read)
+
+
+def vip_line(uid):
+    row = get_vip(uid)
+    if not vip_is_alive(row):
+        return ""
+    if not row[4]:
+        return "🎫 безлимит · бессрочно"
+    return f"🎫 безлимит · до {fmt_dt(datetime.fromisoformat(row[4]))}"
+
+
+# ═══════════════════════════════════════════════════════════════
 # 📦 ПОДПИСКИ (замена «сгорающих слотов»)
 # ═══════════════════════════════════════════════════════════════
 
@@ -405,24 +479,31 @@ def add_subscription(uid, pid, grant_id=None, mode="extend"):
 def get_limits(uid):
     """Лимиты пользователя.
 
-    unlimited=True  — хостинг (или админ): ботов сколько угодно
+    unlimited=True  — безлимит (админ, безлимит-карта или хостинг)
     slots=<N>       — доступно N одновременно работающих ботов
-    until           — крайняя дата окончания среди подписок
+    until           — крайняя дата окончания (None = бессрочно)
+    vip             — выдана безлимит-карта владельцем
     """
     if is_admin(uid):
-        return {"unlimited": True, "slots": None, "until": None, "host": True, "subs": []}
+        return {"unlimited": True, "slots": None, "until": None, "host": True, "vip": False, "admin": True, "subs": []}
     subs = get_active_subs(uid, include_grace=True)
+    vip_row = get_vip(uid)
+    vip = vip_is_alive(vip_row)
+    vip_until = (vip_row[4] if vip and vip_row and vip_row[4] else None)
+    until = max((s[4] for s in subs), default=None)
+    if vip:
+        later = max([x for x in (until, vip_until) if x], default=None)
+        return {"unlimited": True, "slots": None, "until": later, "host": True, "vip": True, "admin": False, "subs": subs}
     host = [s for s in subs if s[2] == "host"]
     bot_subs = [s for s in subs if s[2] == "bot"]
-    until = max((s[4] for s in subs), default=None)
     if host:
-        return {"unlimited": True, "slots": None, "until": until, "host": True, "subs": subs}
-    return {"unlimited": False, "slots": len(bot_subs), "until": until, "host": False, "subs": subs}
+        return {"unlimited": True, "slots": None, "until": until, "host": True, "vip": False, "admin": False, "subs": subs}
+    return {"unlimited": False, "slots": len(bot_subs), "until": until, "host": False, "vip": False, "admin": False, "subs": subs}
 
 
 def has_active_slot(uid):
-    """Есть ли вообще право запускать ботов (с учётом льготного периода)."""
-    if is_admin(uid):
+    """Есть ли вообще право запускать ботов (с учётом льготного периода и безлимита)."""
+    if is_admin(uid) or is_vip(uid):
         return True
     row = _db_read(lambda conn: conn.execute(
         "SELECT COUNT(*) FROM subscriptions WHERE user_id=? AND expires_at > ?",
@@ -432,17 +513,32 @@ def has_active_slot(uid):
 
 def can_add_bot(uid):
     """Можно ли загрузить ещё одного бота. → (bool, причина)"""
-    if is_admin(uid):
+    if is_admin(uid) or is_vip(uid):
         return True, ""
     lim = get_limits(uid)
-    if not lim["subs"]:
-        return False, "нет активной подписки"
     if lim["unlimited"]:
         return True, ""
+    if not lim["subs"]:
+        return False, "нет активной подписки"
     used = len(get_user_bots(uid))
     if used >= lim["slots"]:
         return False, f"заняты все слоты ({used}/{lim['slots']})"
     return True, ""
+
+
+def limits_line(uid):
+    """Короткая строка про лимиты — для меню, карточек и сообщений."""
+    if is_admin(uid):
+        return "👑 Безлимит (админ)"
+    lim = get_limits(uid)
+    if lim.get("vip"):
+        return "🎫 Безлимит-карта" + (f" · до {fmt_dt(datetime.fromisoformat(lim['until']))}" if lim.get("until") else " · бессрочно")
+    if lim["unlimited"]:
+        return "🚀 Хостинг без лимита" + (f" · до {fmt_dt(datetime.fromisoformat(lim['until']))}" if lim.get("until") else "")
+    line = f"🧩 Слотов: {len(get_user_bots(uid))}/{lim['slots'] or 0}"
+    if lim.get("until"):
+        line += f" · до {fmt_dt(datetime.fromisoformat(lim['until']))}"
+    return line
 
 
 def users_expiring_soon():
@@ -618,9 +714,69 @@ def get_stats():
             "bots": c.execute("SELECT COUNT(*) FROM bots").fetchone()[0],
             "frozen": c.execute("SELECT COUNT(*) FROM bots WHERE is_frozen = 1").fetchone()[0],
             "pending": c.execute("SELECT COUNT(*) FROM payment_requests WHERE status = 'pending'").fetchone()[0],
+            "vips": c.execute("SELECT COUNT(*) FROM vip WHERE expires_at IS NULL OR expires_at > ?", (now_iso,)).fetchone()[0],
             "running": len(running_bots),
         }
     return _db_read(read)
+
+
+# ─────────────── СПИСОК ПОЛЬЗОВАТЕЛЕЙ ───────────────
+
+USERS_PER_PAGE = 8
+
+
+def count_users():
+    return _db_read(lambda conn: conn.execute("SELECT COUNT(*) FROM users").fetchone())[0]
+
+
+def fetch_users(page=0, per=USERS_PER_PAGE):
+    return _db_read(lambda conn: conn.execute(
+        "SELECT * FROM users ORDER BY created_at DESC LIMIT ? OFFSET ?",
+        (per, max(0, page) * per)).fetchall())
+
+
+def get_bots_count_map():
+    rows = _db_read(lambda conn: conn.execute("SELECT user_id, COUNT(*) FROM bots GROUP BY user_id").fetchall())
+    return {r[0]: r[1] for r in rows}
+
+
+def get_subs_summary_map():
+    """{user_id: {'bot': N слотов, 'host': 1, 'until': дата}} по активным подпискам."""
+    rows = _db_read(lambda conn: conn.execute(
+        "SELECT user_id, kind, COUNT(*), MAX(expires_at) FROM subscriptions WHERE expires_at > ? GROUP BY user_id, kind",
+        (datetime.now().isoformat(),)).fetchall())
+    m = {}
+    for uid, kind, n, until in rows:
+        d = m.setdefault(uid, {"bot": 0, "host": 0, "until": None})
+        if kind == "bot":
+            d["bot"] += n
+        else:
+            d["host"] = 1
+        if until and (not d["until"] or until > d["until"]):
+            d["until"] = until
+    return m
+
+
+def get_vip_map():
+    return {r[0]: r for r in get_all_vips()}
+
+
+def user_flag_emoji(u, vip_map=None):
+    if u[4]:
+        return "🚫"
+    if u[3]:
+        return "🛡"
+    if vip_map is not None and vip_is_alive(vip_map.get(u[0])):
+        return "🎫"
+    return "👤"
+
+
+def bot_status_emoji(b):
+    if b[0] in running_bots:
+        return "🟢"
+    if b[6]:
+        return "🧊"
+    return "🔴"
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -1119,8 +1275,10 @@ class AdminStates(StatesGroup):
     promo_plan = State()
     promo_uses = State()
     search_bot = State()
+    search_user = State()
     grant_uid = State()
     grant_plan = State()
+    vip_uid = State()
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -1188,7 +1346,9 @@ def main_menu_kb(uid):
     lim = get_limits(uid)
     until = lim.get("until")
     urgent = False
-    if until:
+    if lim["unlimited"]:
+        urgent = False
+    elif until:
         left = (datetime.fromisoformat(until) - datetime.now()).total_seconds()
         urgent = left <= NOTIFY_BEFORE_DAYS * 86400
     elif not lim["unlimited"] and not is_admin(uid):
@@ -1304,7 +1464,8 @@ async def send_sub_activated(uid, pid, res):
     else:
         head = "🎉 <b>Оплата подтверждена!</b>"
     lim = get_limits(uid)
-    limit_line = "🚀 Ботов можно запускать <b>без лимита</b>." if lim["unlimited"] else f"🧩 Доступно слотов: <b>{lim['slots']}</b>."
+    limit_line = ("🎫 Безлимит-карта: ботов можно запускать <b>без лимита</b>." if is_vip(uid)
+                  else ("🚀 Ботов можно запускать <b>без лимита</b>." if lim["unlimited"] else f"🧩 Доступно слотов: <b>{lim['slots']}</b>."))
     try:
         await bot.send_message(
             uid,
@@ -1336,13 +1497,14 @@ async def cmd_start(message: types.Message, state: FSMContext):
     create_user(message.from_user.id, message.from_user.username or "", message.from_user.full_name or "")
     name = html.escape(message.from_user.first_name or "друг")
     lim = get_limits(message.from_user.id)
-    if lim["unlimited"]:
-        sub_line = "🚀 Твой режим: <b>боты без лимита</b>" + (f" · до {fmt_dt(datetime.fromisoformat(lim['until']))}" if lim.get("until") else "")
-    elif lim["slots"]:
-        used = len(get_user_bots(message.from_user.id))
-        sub_line = f"🧩 Слотов: <b>{used}/{lim['slots']}</b>" + (f" · до {fmt_dt(datetime.fromisoformat(lim['until']))}" if lim.get("until") else "")
-    else:
-        sub_line = "📦 Активной подписки нет — боты не запускаются"
+    badges = []
+    if lim.get("vip"):
+        badges.append("🎫 безлимит-карта")
+    if is_admin(message.from_user.id):
+        badges.append("👑 админ")
+    sub_line = "📦 " + limits_line(message.from_user.id)
+    if badges:
+        sub_line = " · ".join(badges) + "\n" + sub_line
     text = (
         f"👋 <b>Привет, {name}!</b>\n\n"
         f"Добро пожаловать в <b>BotHost</b> — загрузил проект, настроил переменные и запускаешь. 🚀\n\n"
@@ -1586,9 +1748,7 @@ async def handle_token(message: types.Message, state: FSMContext):
         if ep:
             write_wrapper(bot_dir, ep)
         await archive_bot_files(bid)
-        lim = get_limits(message.from_user.id)
-        slot_line = ("🚀 Слотов неограниченно" if lim["unlimited"]
-                     else f"🧩 Занято слотов: <b>{len(get_user_bots(message.from_user.id))}/{lim['slots']}</b>")
+        slot_line = "📦 " + limits_line(message.from_user.id)
         if not ep:
             await msg.edit_text(
                 f"⚠️ <b>Бот #{bid} загружен, но .py файл не найден.</b>\n\n"
@@ -1648,6 +1808,21 @@ def subs_page(uid):
                     [InlineKeyboardButton(text="« Меню", callback_data="back_main")]]))
 
     lim = get_limits(uid)
+    vip_row = get_vip(uid)
+    if lim.get("vip"):
+        vip_until = vip_row[4] if vip_row else None
+        text = (
+            "📦 <b>Моя подписка</b>\n\n"
+            "🎫 <b>Безлимит-карта от владельца</b>\n"
+            + (f"⏳ Действует до: <b>{fmt_dt(datetime.fromisoformat(vip_until))}</b>\n" if vip_until else "♾ Действует <b>бессрочно</b>\n")
+            + f"🤖 Проектов загружено: <b>{len(get_user_bots(uid))}</b>\n\n"
+            "Лимита на количество ботов нет — загружай сколько нужно."
+        )
+        return (text, InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="📤 Загрузить проект", callback_data="upload"),
+             InlineKeyboardButton(text="🤖 Мои проекты", callback_data="mybots")],
+            [InlineKeyboardButton(text="« Меню", callback_data="back_main")]]))
+
     subs = lim["subs"]
     used = len(get_user_bots(uid))
     now = datetime.now()
@@ -1879,7 +2054,9 @@ async def process_promo(message: types.Message, state: FSMContext):
     if ok:
         p = PLANS[res]
         lim = get_limits(message.from_user.id)
-        limit_line = "🚀 Теперь ботов можно запускать <b>без лимита</b>." if lim["unlimited"] else f"🧩 Доступно слотов: <b>{lim['slots']}</b>."
+        limit_line = ("🎫 Выдана безлимит-карта: ботов можно запускать <b>без лимита</b>." if lim.get("vip")
+                      else ("🚀 Теперь ботов можно запускать <b>без лимита</b>." if lim["unlimited"]
+                            else f"🧩 Доступно слотов: <b>{lim['slots']}</b>."))
         await message.answer(
             f"🎉 <b>Промокод активирован!</b>\n\n"
             f"{KINDS[p['kind']]['emoji']} {KINDS[p['kind']]['name']}\n"
@@ -1937,8 +2114,7 @@ async def cb_mybots(call: types.CallbackQuery, state: FSMContext = None):
     if state:
         await state.clear()
     bots = get_user_bots(call.from_user.id)
-    lim = get_limits(call.from_user.id)
-    limit_line = "🚀 Без лимита" if lim["unlimited"] else f"🧩 {len(bots)}/{lim['slots'] or 0} слотов"
+    limit_line = limits_line(call.from_user.id)
     if not bots:
         return await call.message.edit_text(
             f"🤖 <b>Нет ботов</b> ({limit_line})\n\nЗагрузи первого!",
@@ -1972,9 +2148,7 @@ async def cb_bot_detail(call: types.CallbackQuery, state: FSMContext = None):
     status = "🧊 Заморожен" if b[6] else ("🟢 Работает" if bid in running_bots else "🔴 Остановлен")
     auto_r = "ВКЛ ✅" if (len(b) > 8 and b[8] == 1) else "ВЫКЛ ❌"
     ep = b[7] if len(b) > 7 else "user_bot.py"
-    lim = get_limits(b[1])
-    limits_line = "🚀 Без лимита ботов" if lim["unlimited"] else f"🧩 Слотов: {len(get_user_bots(b[1]))}/{lim['slots'] or 0}" + (
-        f" · до {fmt_dt(datetime.fromisoformat(lim['until']))}" if lim.get("until") else "")
+    lim_text = limits_line(b[1])
 
     kb = [
         [InlineKeyboardButton(text="▶️ Запуск", callback_data=f"start:{bid}"),
@@ -2002,7 +2176,7 @@ async def cb_bot_detail(call: types.CallbackQuery, state: FSMContext = None):
         f"📁 <code>{html.escape(str(b[2]))}</code>\n"
         f"🚀 <code>{html.escape(str(ep))}</code>\n"
         f"📊 {status}\n"
-        f"📦 {limits_line}"
+        f"📦 {lim_text}"
     )
     try:
         await call.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=kb), parse_mode="HTML")
@@ -2359,7 +2533,7 @@ async def cb_admin(call: types.CallbackQuery, state: FSMContext = None):
     pay_btn = "💰 Заявки 🔴" if s["pending"] > 0 else "💰 Заявки"
     text = (
         f"👑 <b>Панель управления</b>\n\n"
-        f"👥 {s['users']} | 🚫 {s['banned']} | 🛡 {s['admins']}\n"
+        f"👥 Пользователей: {s['users']} | 🚫 {s['banned']} | 🛡 {s['admins']} | 🎫 {s['vips']}\n"
         f"🧩 Слотов: {s['slots']} | 🚀 Хостингов: {s['hosts']}\n"
         f"🔔 Истекают ≤{NOTIFY_BEFORE_DAYS:g} дн.: {s['soon']}\n"
         f"🤖 Ботов: {s['bots']} (🟢 {s['running']} | 🧊 {s['frozen']})\n"
@@ -2368,9 +2542,13 @@ async def cb_admin(call: types.CallbackQuery, state: FSMContext = None):
     )
     kb = [
         [InlineKeyboardButton(text=pay_btn, callback_data="adm_payments"),
-         InlineKeyboardButton(text="🎁 Промокоды", callback_data="adm_promos")],
+         InlineKeyboardButton(text="🎟 Промокоды", callback_data="adm_promos")],
+        [InlineKeyboardButton(text=f"👥 Пользователи ({s['users']})", callback_data="adm_users:0"),
+         InlineKeyboardButton(text="🔍 Найти юзера", callback_data="adm_searchuser")],
+        [InlineKeyboardButton(text=f"🎫 Безлимит-карты ({s['vips']})", callback_data="adm_vip_list"),
+         InlineKeyboardButton(text="🎫 Выдать безлимит", callback_data="adm_vip_add")],
         [InlineKeyboardButton(text="📦 Подписки", callback_data="adm_subs"),
-         InlineKeyboardButton(text="🎁 Выдать подписку", callback_data="adm_grant")],
+         InlineKeyboardButton(text="💳 Выдать подписку", callback_data="adm_grant")],
         [InlineKeyboardButton(text="🤖 Все боты", callback_data="adm_allbots"),
          InlineKeyboardButton(text="🔍 Поиск бота", callback_data="adm_searchbot")],
         [InlineKeyboardButton(text="✉️ ЛС юзеру", callback_data="adm_msguser"),
@@ -2385,6 +2563,355 @@ async def cb_admin(call: types.CallbackQuery, state: FSMContext = None):
         [InlineKeyboardButton(text="« Меню", callback_data="back_main")]
     ]
     await call.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=kb), parse_mode="HTML")
+
+
+# ═══════════════════════════════════════════════════════════════
+# 👥 ПОЛЬЗОВАТЕЛИ (админ)
+# ═══════════════════════════════════════════════════════════════
+
+@dp.callback_query(F.data.startswith("adm_users:"))
+async def cb_adm_users(call: types.CallbackQuery):
+    if not is_admin(call.from_user.id):
+        return
+    try:
+        page = int(call.data.split(":")[1])
+    except Exception:
+        page = 0
+    total = count_users()
+    pages = max(1, (total + USERS_PER_PAGE - 1) // USERS_PER_PAGE)
+    page = max(0, min(page, pages - 1))
+    users = fetch_users(page)
+    bots_map = get_bots_count_map()
+    subs_map = get_subs_summary_map()
+    vip_map = get_vip_map()
+    s = get_stats()
+
+    text = (
+        f"👥 <b>Пользователи</b> · всего {total}\n"
+        f"Стр. {page + 1}/{pages} · 🚫 {s['banned']} · 🛡 {s['admins']} · 🎫 {s['vips']}\n\n"
+        f"👤 обычный · 🎫 безлимит · 🛡 админ · 🚫 бан\n"
+        f"🤖 — сколько ботов · 🧩/🚀 — подписка"
+    )
+    kb = []
+    for u in users:
+        n_bots = bots_map.get(u[0], 0)
+        sub = subs_map.get(u[0])
+        if vip_is_alive(vip_map.get(u[0])):
+            sub_txt = "🎫"
+        elif sub and sub["host"]:
+            sub_txt = "🚀"
+        elif sub and sub["bot"]:
+            sub_txt = f"🧩{sub['bot']}"
+        else:
+            sub_txt = "—"
+        uname = f"@{u[1]}" if u[1] else (u[2] or "без имени")[:12]
+        label = f"{user_flag_emoji(u, vip_map)} {u[0]} {uname} · 🤖{n_bots} · {sub_txt}"
+        kb.append([InlineKeyboardButton(text=label[:64], callback_data=f"adm_u:{u[0]}")])
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton(text="⬅️", callback_data=f"adm_users:{page - 1}"))
+    nav.append(InlineKeyboardButton(text=f"{page + 1}/{pages}", callback_data="adm_noop"))
+    if page < pages - 1:
+        nav.append(InlineKeyboardButton(text="➡️", callback_data=f"adm_users:{page + 1}"))
+    kb.append(nav)
+    kb.append([InlineKeyboardButton(text="🔍 Найти юзера", callback_data="adm_searchuser"),
+               InlineKeyboardButton(text="🎫 Безлимит-карты", callback_data="adm_vip_list")])
+    kb.append([InlineKeyboardButton(text="« Админка", callback_data="admin")])
+    await call.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=kb), parse_mode="HTML")
+
+
+@dp.callback_query(F.data == "adm_noop")
+async def cb_adm_noop(call: types.CallbackQuery):
+    await call.answer("Это счётчик страниц 🙂")
+
+
+def user_card(uid):
+    """Карточка пользователя: аккаунт, подписки, безлимит, его боты."""
+    u = get_user(uid)
+    if not u:
+        return None, None
+    bots = get_user_bots(uid)
+    lim = get_limits(uid)
+    vip_row = get_vip(uid)
+    running = sum(1 for b in bots if b[0] in running_bots)
+    frozen = sum(1 for b in bots if b[6])
+
+    flags = []
+    if u[4]:
+        flags.append("🚫 забанен")
+    if u[3]:
+        flags.append("🛡 админ")
+    if vip_is_alive(vip_row):
+        flags.append("🎫 безлимит-карта")
+    if not flags:
+        flags.append("👤 обычный пользователь")
+
+    subs = lim["subs"]
+    if lim.get("vip") and vip_row and vip_row[4]:
+        subs_txt = f"🎫 безлимит до {fmt_dt(datetime.fromisoformat(vip_row[4]))}"
+    elif lim.get("vip"):
+        subs_txt = "🎫 безлимит бессрочно"
+    elif is_admin(uid):
+        subs_txt = "👑 админ — безлимит"
+    elif subs:
+        subs_txt = "\n".join(
+            f"   • {KINDS.get(s[2], {}).get('emoji', '•')} {PLANS.get(s[3], {}).get('name', s[3])} — {human_left(s[4])}"
+            for s in subs)
+    else:
+        subs_txt = "❌ нет активных подписок"
+    created = ""
+    try:
+        created = fmt_dt(datetime.fromisoformat(u[5]))
+    except Exception:
+        pass
+
+    text = (
+        f"{user_flag_emoji(u, get_vip_map())} <b>{html.escape(u[2] or 'без имени')}</b>\n"
+        f"🆔 <code>{uid}</code> · @{u[1] or '—'}\n"
+        f"📅 Регистрация: {created or '—'}\n"
+        f"🏷 Статус: {', '.join(flags)}\n\n"
+        f"📦 Подписки:\n{subs_txt}\n"
+        f"📊 Лимит: {limits_line(uid)}\n\n"
+        f"🤖 Боты: <b>{len(bots)}</b> (🟢 {running} · 🔴 {len(bots) - running - frozen} · 🧊 {frozen})"
+    )
+    kb = []
+    for b in bots[:8]:
+        kb.append([InlineKeyboardButton(
+            text=f"{bot_status_emoji(b)} #{b[0]} {(b[2] or '?')[:16]}",
+            callback_data=f"bot:{b[0]}")])
+    if len(bots) > 8:
+        kb.append([InlineKeyboardButton(text=f"…и ещё {len(bots) - 8} (см. «Все боты»)", callback_data="adm_allbots")])
+
+    if vip_is_alive(vip_row):
+        kb.append([InlineKeyboardButton(text="🎫 Снять безлимит", callback_data=f"adm_unvip:{uid}"),
+                   InlineKeyboardButton(text="♻️ Продлить безлимит", callback_data=f"adm_vip:{uid}")])
+    else:
+        kb.append([InlineKeyboardButton(text="🎫 Выдать безлимит", callback_data=f"adm_vip:{uid}")])
+    kb.append([InlineKeyboardButton(text="💳 Выдать подписку", callback_data=f"adm_grant_to:{uid}"),
+               InlineKeyboardButton(text="✉️ Написать", callback_data=f"adm_dm:{uid}")])
+    kb.append([InlineKeyboardButton(text="✅ Разбан" if u[4] else "🚫 Бан", callback_data=f"adm_act_toggleban:{uid}")])
+    kb.append([InlineKeyboardButton(text="« К списку юзеров", callback_data="adm_users:0")])
+    return text, InlineKeyboardMarkup(inline_keyboard=kb)
+
+
+@dp.callback_query(F.data.startswith("adm_u:"))
+async def cb_adm_user_card(call: types.CallbackQuery):
+    if not is_admin(call.from_user.id):
+        return
+    uid = int(call.data.split(":")[1])
+    text, kb = user_card(uid)
+    if not text:
+        return await call.answer("Пользователь не найден", show_alert=True)
+    try:
+        await call.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
+    except Exception:
+        await call.message.answer(text, reply_markup=kb, parse_mode="HTML")
+
+
+@dp.callback_query(F.data == "adm_searchuser")
+async def cb_adm_searchuser(call: types.CallbackQuery, state: FSMContext):
+    if not is_admin(call.from_user.id):
+        return
+    await state.set_state(AdminStates.search_user)
+    await call.message.edit_text(
+        "🔍 <b>Поиск пользователя</b>\n\nОтправь ID или @username:",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="« К списку", callback_data="adm_users:0")]]),
+        parse_mode="HTML")
+
+
+@dp.message(AdminStates.search_user)
+async def adm_searchuser_do(message: types.Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        return
+    txt = (message.text or "").strip()
+    uid = find_user_by_username(txt) if txt.startswith("@") else (int(txt) if txt.isdigit() else None)
+    if not uid:
+        return await message.answer("❌ Не нашёл. Отправь числовой ID или @username.")
+    await state.clear()
+    text, kb = user_card(uid)
+    if not text:
+        return await message.answer("❌ Пользователь не найден")
+    await message.answer(text, reply_markup=kb, parse_mode="HTML")
+
+
+# ═══════════════════════════════════════════════════════════════
+# 🎫 БЕЗЛИМИТ-КАРТЫ (админ)
+# ═══════════════════════════════════════════════════════════════
+
+def vip_days_kb(uid, back=None):
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="♾ Навсегда", callback_data=f"adm_vip_set:{uid}:0")],
+        [InlineKeyboardButton(text="90 дней", callback_data=f"adm_vip_set:{uid}:90"),
+         InlineKeyboardButton(text="30 дней", callback_data=f"adm_vip_set:{uid}:30")],
+        [InlineKeyboardButton(text="7 дней", callback_data=f"adm_vip_set:{uid}:7"),
+         InlineKeyboardButton(text="1 день", callback_data=f"adm_vip_set:{uid}:1")],
+        [InlineKeyboardButton(text="« Назад", callback_data=back or f"adm_u:{uid}")]
+    ])
+
+
+@dp.callback_query(F.data == "adm_vip_list")
+async def cb_adm_vip_list(call: types.CallbackQuery):
+    if not is_admin(call.from_user.id):
+        return
+    rows = get_all_vips()
+    bg_map = get_bots_count_map()
+    if not rows:
+        return await call.message.edit_text(
+            "🎫 <b>Безлимит-карты</b>\n\nПока никому не выдано.\n\n"
+            "Безлимит-карта даёт пользователю запускать сколько угодно ботов, "
+            "но <b>не даёт доступ к админ-панели</b>.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="➕ Выдать безлимит", callback_data="adm_vip_add")],
+                [InlineKeyboardButton(text="« Админка", callback_data="admin")]]),
+            parse_mode="HTML")
+    text = f"🎫 <b>Безлимит-карты ({len(rows)})</b>\n\n"
+    kb = []
+    for r in rows:
+        uid = r[0]
+        u = get_user(uid)
+        uname = f"@{u[1]}" if u and u[1] else ((u[2] if u else "") or "без имени")[:14]
+        until = f"до {fmt_dt(datetime.fromisoformat(r[4]))}" if r[4] else "♾ навсегда"
+        text += f"• <code>{uid}</code> {html.escape(uname)} — {until} · 🤖 {bg_map.get(uid, 0)}\n"
+        kb.append([
+            InlineKeyboardButton(text=f"👤 {uname} · {('до ' + r[4][:10]) if r[4] else '♾'}", callback_data=f"adm_u:{uid}"),
+            InlineKeyboardButton(text="❌", callback_data=f"adm_unvip:{uid}")
+        ])
+    kb.append([InlineKeyboardButton(text="➕ Выдать безлимит", callback_data="adm_vip_add")])
+    kb.append([InlineKeyboardButton(text="« Админка", callback_data="admin")])
+    await call.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=kb), parse_mode="HTML")
+
+
+@dp.callback_query(F.data == "adm_vip_add")
+async def cb_adm_vip_add(call: types.CallbackQuery, state: FSMContext):
+    if not is_admin(call.from_user.id):
+        return
+    await state.set_state(AdminStates.vip_uid)
+    await call.message.edit_text(
+        "🎫 <b>Выдача безлимит-карты</b>\n\n"
+        "Отправь ID или @username получателя.\n"
+        "Пользователь получит безлимит на ботов, но <b>не</b> доступ к админке.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="« Отмена", callback_data="admin")]]),
+        parse_mode="HTML")
+
+
+@dp.message(AdminStates.vip_uid)
+async def adm_vip_uid(message: types.Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        return
+    txt = (message.text or "").strip()
+    uid = find_user_by_username(txt) if txt.startswith("@") else (int(txt) if txt.isdigit() else None)
+    if not uid:
+        return await message.answer("❌ Не нашёл. Отправь числовой ID или @username.")
+    await state.clear()
+    u = get_user(uid)
+    who = f"@{u[1]}" if u and u[1] else ((u[2] if u else "") or "новый пользователь")
+    await message.answer(
+        f"🎫 Кому: <code>{uid}</code> ({html.escape(who)})\n\nНа какой срок выдать безлимит?",
+        reply_markup=vip_days_kb(uid, back="admin"),
+        parse_mode="HTML")
+
+
+@dp.callback_query(F.data.startswith("adm_vip_set:"))
+async def cb_adm_vip_set(call: types.CallbackQuery):
+    if not is_admin(call.from_user.id):
+        return
+    _, uid_s, days_s = call.data.split(":")
+    uid, days = int(uid_s), int(days_s)
+    exp = grant_vip(uid, days or None, granted_by=call.from_user.id)
+    u = get_user(uid)
+    who = f"@{u[1]}" if u and u[1] else ""
+    await call.answer("🎫 Безлимит выдан" if not exp else f"🎫 Выдан до {fmt_dt(datetime.fromisoformat(exp))}", show_alert=True)
+    try:
+        await bot.send_message(
+            uid,
+            "🎫 <b>Владелец выдал тебе безлимит-карту!</b>\n\n"
+            + (f"⏳ Действует до: <b>{fmt_dt(datetime.fromisoformat(exp))}</b>\n" if exp else "♾ Действует <b>бессрочно</b>\n")
+            + "\nТеперь можно запускать сколько угодно ботов — слотов и лимитов нет.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="➕ Загрузить бота", callback_data="upload")],
+                [InlineKeyboardButton(text="📦 Моя подписка", callback_data="myslots")]]),
+            parse_mode="HTML")
+    except Exception as e:
+        logger.warning("Не удалось уведомить %s о безлимите: %s", uid, e)
+    logger.info("🎫 Безлимит выдан %s (%s) владельцем %s", uid, exp or "бессрочно", call.from_user.id)
+    text, kb = user_card(uid)
+    if text:
+        try:
+            await call.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
+        except Exception:
+            await call.message.answer(text, reply_markup=kb, parse_mode="HTML")
+    else:
+        await call.message.edit_text(f"✅ Безлимит выдан <code>{uid}</code> {who}".strip(), parse_mode="HTML")
+
+
+@dp.callback_query(F.data.startswith("adm_vip:"))
+async def cb_adm_vip_menu(call: types.CallbackQuery):
+    if not is_admin(call.from_user.id):
+        return
+    uid = int(call.data.split(":")[1])
+    u = get_user(uid)
+    who = f"@{u[1]}" if u and u[1] else ((u[2] if u else "") or "новый пользователь")
+    await call.message.edit_text(
+        f"🎫 Кому: <code>{uid}</code> ({html.escape(who)})\n\nНа какой срок выдать безлимит?",
+        reply_markup=vip_days_kb(uid),
+        parse_mode="HTML")
+
+
+@dp.callback_query(F.data.startswith("adm_unvip:"))
+async def cb_adm_unvip(call: types.CallbackQuery):
+    if not is_admin(call.from_user.id):
+        return
+    uid = int(call.data.split(":")[1])
+    removed = revoke_vip(uid)
+    await call.answer("🎫 Безлимит снят" if removed else "Карты и не было", show_alert=True)
+    if removed:
+        try:
+            await bot.send_message(
+                uid,
+                "🎫 <b>Безлимит-карта отозвана владельцем.</b>\n\n"
+                "Боты продолжат работать, если есть активная подписка — иначе они остановятся.",
+                parse_mode="HTML")
+        except Exception:
+            pass
+        logger.info("🎫 Безлимит снят у %s владельцем %s", uid, call.from_user.id)
+    # Возвращаемся туда, откуда пришли: в карточку юзера или в список карт.
+    text, kb = user_card(uid)
+    if text:
+        try:
+            return await call.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
+        except Exception:
+            pass
+    await cb_adm_vip_list(call)
+
+
+@dp.callback_query(F.data.startswith("adm_grant_to:"))
+async def cb_adm_grant_to(call: types.CallbackQuery, state: FSMContext):
+    if not is_admin(call.from_user.id):
+        return
+    uid = int(call.data.split(":")[1])
+    await state.set_state(AdminStates.grant_plan)
+    await state.update_data(grant_uid=uid)
+    rows = []
+    for kind in ("bot", "host"):
+        for pid, p in plans_of_kind(kind):
+            rows.append([InlineKeyboardButton(text=f"{p['emoji']} {p['name']} · {p['days']} дн.", callback_data=f"adm_grant_plan:{pid}")])
+    rows.append([InlineKeyboardButton(text="« Отмена", callback_data=f"adm_u:{uid}")])
+    await call.message.edit_text(
+        f"💳 Выдать подписку <code>{uid}</code>\n\nВыбери тариф:",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
+        parse_mode="HTML")
+
+
+@dp.callback_query(F.data.startswith("adm_dm:"))
+async def cb_adm_dm(call: types.CallbackQuery, state: FSMContext):
+    if not is_admin(call.from_user.id):
+        return
+    uid = int(call.data.split(":")[1])
+    await state.set_state(AdminStates.msg_text)
+    await state.update_data(target_uid=uid)
+    await call.message.edit_text(f"✉️ Текст для <code>{uid}</code>:", parse_mode="HTML")
 
 
 # ─────────────── ПОДПИСКИ В АДМИНКЕ ───────────────
@@ -2777,27 +3304,10 @@ async def cb_adm_viewuser_id(call: types.CallbackQuery):
     if not is_admin(call.from_user.id):
         return
     uid = int(call.data.split(":")[1])
-    u = get_user(uid)
-    if not u:
+    text, kb = user_card(uid)
+    if not text:
         return await call.answer("Не найден", show_alert=True)
-    lim = get_limits(uid)
-    subs = lim["subs"]
-    subs_line = "нет активных"
-    if is_admin(uid):
-        subs_line = "👑 админ (безлимит)"
-    elif subs:
-        subs_line = ", ".join(f"{PLANS.get(s[3], {}).get('name', s[3])} ({human_left(s[4])})" for s in subs)
-    text = (
-        f"👤 <b>Юзер</b>\nID: <code>{u[0]}</code>\n@{u[1] or '—'}\n"
-        f"Бан: {'Да' if u[4] else 'Нет'}\nБотов: {len(get_user_bots(uid))}\n"
-        f"📦 Подписки: {subs_line}"
-    )
-    kb = [
-        [InlineKeyboardButton(text="📦 Выдать подписку", callback_data="adm_grant")],
-        [InlineKeyboardButton(text="🚫 Бан" if not u[4] else "✅ Разбан", callback_data=f"adm_act_toggleban:{u[0]}")],
-        [InlineKeyboardButton(text="« Админка", callback_data="admin")]
-    ]
-    await call.message.answer(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=kb), parse_mode="HTML")
+    await call.message.answer(text, reply_markup=kb, parse_mode="HTML")
 
 
 @dp.callback_query(F.data.startswith("adm_act_toggleban:"))
@@ -2810,12 +3320,20 @@ async def cb_adm_toggleban(call: types.CallbackQuery):
         return
     if u[4]:
         unban_user(uid)
+        await call.answer("✅ Разбанен")
     else:
         ban_user(uid)
         for b in get_user_bots(uid):
             await stop_user_bot(b[0])
-    await call.answer("Готово")
-    await cb_admin(call, None)
+        await call.answer("🚫 Забанен, боты остановлены", show_alert=True)
+    text, kb = user_card(uid)
+    if text:
+        try:
+            await call.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
+        except Exception:
+            await call.message.answer(text, reply_markup=kb, parse_mode="HTML")
+    else:
+        await cb_admin(call, None)
 
 
 @dp.callback_query(F.data == "adm_msguser")
