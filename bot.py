@@ -141,9 +141,9 @@ PLANS = {
     "2weeks": {"name": "2 недели", "stars": 25, "days": 14, "kind": "bot",  "emoji": "🗓"},
     "month":  {"name": "Месяц",    "stars": 50, "days": 30, "kind": "bot",  "emoji": "💎"},
     # 🚀 Хостинг без лимита ботов
-    "host_week":   {"name": "Хостинг · Неделя",   "stars": 39,  "days": 7,  "kind": "host", "emoji": "🚀"},
-    "host_2weeks": {"name": "Хостинг · 2 недели", "stars": 65,  "days": 14, "kind": "host", "emoji": "🛰"},
-    "host_month":  {"name": "Хостинг · Месяц",    "stars": 130, "days": 30, "kind": "host", "emoji": "🌌"},
+    "host_week":   {"name": "Хостинг · Неделя",   "stars": 50,  "days": 7,  "kind": "host", "emoji": "🚀"},
+    "host_2weeks": {"name": "Хостинг · 2 недели", "stars": 100,  "days": 14, "kind": "host", "emoji": "🛰"},
+    "host_month":  {"name": "Хостинг · Месяц",    "stars": 100, "days": 30, "kind": "host", "emoji": "🌌"},
 }
 
 KINDS = {
@@ -1794,7 +1794,7 @@ async def back_main(call: types.CallbackQuery, state: FSMContext):
     await state.clear()
     lim = get_limits(call.from_user.id)
     if lim["unlimited"]:
-        head = "🏠 <b>BotHost</b> · 🚀 без лимита ботов"
+        head = "🏠 <b>BotHost</b>"
     elif lim["slots"]:
         head = f"🏠 <b>BotHost</b> · 🧩 слотов: {len(get_user_bots(call.from_user.id))}/{lim['slots']}"
     else:
