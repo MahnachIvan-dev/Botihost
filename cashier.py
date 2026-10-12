@@ -1,4 +1,4 @@
-"""BotHost AI Cashier v2.1 — проверка оплаты подарком (2 скрина + эталоны).
+"""BotHost AI Cashier v2.2 — проверка оплаты подарком (2 скрина + эталоны).
 
 Что исправлено по сравнению с прошлой версией:
   • Тарифы синхронизированы с BotHost v9: слоты на бота (🧩) и хостинг (🚀).
@@ -18,12 +18,13 @@
   • Кулдаун после оплаты настраивается (по умолчанию 5 мин вместо 1 часа).
   • Понятные ошибки TelegramConflictError и команда /diag для владельца.
 """
-import os, re, json, base64, asyncio, logging, hmac, hashlib, io, html
+import os, re, json, base64, asyncio, logging, hmac, hashlib, io, html, time
 from datetime import datetime, timedelta, timezone
 from uuid import uuid4
 from pathlib import Path
+from collections import deque
 
-from aiogram import Bot, Dispatcher, types, F
+from aiogram import Bot, Dispatcher, types, F, BaseMiddleware
 from aiogram.exceptions import TelegramConflictError, TelegramUnauthorizedError
 from aiogram.filters import CommandStart, Command
 from aiogram.fsm.context import FSMContext
@@ -62,11 +63,17 @@ COOLDOWN_SECONDS = max(0, int(float(os.environ.get("CASHIER_COOLDOWN_MIN", "5"))
 ENABLE_SERVICES = os.environ.get("CASHIER_SERVICES", "0").strip().lower() in {"1", "true", "yes", "on"}
 # 🖼 Ограничения на скрины перед отправкой в ИИ
 MAX_IMAGE_SIDE = int(os.environ.get("CASHIER_IMAGE_SIDE", "1600"))
-MAX_IMAGE_BYTES = int(os.environ.get("CASHIER_IMAGE_MAX_BYTES", "3500000"))
+MAX_IMAGE_BYTES = max(100_000, min(5_000_000, int(os.environ.get("CASHIER_IMAGE_MAX_BYTES", "3500000"))))
+MAX_RAW_IMAGE_BYTES = max(1_000_000, min(15_000_000, int(os.environ.get("CASHIER_RAW_IMAGE_MAX_BYTES", "10000000"))))
 DEFAULT_TOLERANCE = 10
 REVIEW_TTL_DAYS = 7
 
 payment_guard_lock = asyncio.Lock()
+MAX_CONCURRENT_CHECKS = max(1, min(4, int(os.environ.get("CASHIER_MAX_CONCURRENT_CHECKS", "2"))))
+verification_semaphore = asyncio.Semaphore(MAX_CONCURRENT_CHECKS)
+cashier_rate_buckets = {}
+CASHIER_RATE_EVENTS = max(8, min(60, int(os.environ.get("CASHIER_RATE_EVENTS", "20"))))
+CASHIER_RATE_WINDOW = max(3, min(60, int(os.environ.get("CASHIER_RATE_WINDOW", "10"))))
 service_requests = {}   # request_id -> {uid, service_key, uses, stars, status, created_at}
 manual_reviews = {}     # review_id  -> {uid, plan, ..., created_at}
 _ref_cache = {"key": None, "b64": None}
@@ -76,6 +83,29 @@ log = logging.getLogger("Cashier")
 
 bot = Bot(token=CASHIER_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
+
+
+class CashierRateLimitMiddleware(BaseMiddleware):
+    async def __call__(self, handler, event, data):
+        user = data.get("event_from_user")
+        if user and user.id != OWNER_ID:
+            now = time.monotonic()
+            bucket = cashier_rate_buckets.setdefault(user.id, deque())
+            while bucket and now - bucket[0] > CASHIER_RATE_WINDOW:
+                bucket.popleft()
+            if len(bucket) >= CASHIER_RATE_EVENTS:
+                if isinstance(event, types.Message):
+                    try:
+                        await event.answer("⏳ Слишком много запросов подряд. Подожди немного.")
+                    except Exception:
+                        pass
+                return
+            bucket.append(now)
+        return await handler(event, data)
+
+
+dp.message.middleware(CashierRateLimitMiddleware())
+dp.callback_query.middleware(CashierRateLimitMiddleware())
 groq_client = AsyncGroq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
 
 # ───────────────────────────────────────────────────────────────
@@ -294,19 +324,24 @@ def normalize_image_bytes(raw: bytes) -> bytes:
                     return data
             im.thumbnail((max(1, int(im.width * 0.8)), max(1, int(im.height * 0.8))), Image.Resampling.LANCZOS)
         return data
-    except UnidentifiedImageError:
-        log.warning("Присланный файл не является изображением — отправляю как есть")
-        return raw
-    except Exception:
-        log.exception("Не удалось сжать изображение — отправляю как есть")
-        return raw
+    except UnidentifiedImageError as exc:
+        raise ValueError("Файл не распознан как изображение. Пришли обычный скриншот.") from exc
+    except Exception as exc:
+        log.warning("Ошибка обработки изображения: %s", type(exc).__name__)
+        raise ValueError("Не удалось безопасно обработать изображение. Попробуй другой скриншот.") from exc
 
 
 async def photo_b64(message: types.Message) -> str:
     photo = message.photo[-1]
+    if photo.file_size and photo.file_size > MAX_RAW_IMAGE_BYTES:
+        raise ValueError(f"Скриншот слишком большой. Максимум {MAX_RAW_IMAGE_BYTES // (1024*1024)} МБ.")
     info = await bot.get_file(photo.file_id)
+    if info.file_size and info.file_size > MAX_RAW_IMAGE_BYTES:
+        raise ValueError(f"Скриншот слишком большой. Максимум {MAX_RAW_IMAGE_BYTES // (1024*1024)} МБ.")
     buf = await bot.download_file(info.file_path)
-    raw = buf.read()
+    raw = buf.read(MAX_RAW_IMAGE_BYTES + 1)
+    if len(raw) > MAX_RAW_IMAGE_BYTES:
+        raise ValueError(f"Скриншот слишком большой. Максимум {MAX_RAW_IMAGE_BYTES // (1024*1024)} МБ.")
     return base64.b64encode(normalize_image_bytes(raw)).decode()
 
 
@@ -379,15 +414,21 @@ def sign(kind, *parts):
 
 
 async def send_channel(text):
+    """Bounded retry for signed sync events; receivers make payment events idempotent."""
     if not SYNC_CHANNEL_ID:
         log.error("SYNC_CHANNEL_ID не задан — сообщение в канал не отправлено")
         return False
-    try:
-        await bot.send_message(SYNC_CHANNEL_ID, text)
-        return True
-    except Exception as e:
-        log.error("sync channel: %s", e)
-        return False
+    last_error = None
+    for attempt in range(3):
+        try:
+            await bot.send_message(SYNC_CHANNEL_ID, text)
+            return True
+        except Exception as e:
+            last_error = e
+            if attempt < 2:
+                await asyncio.sleep(0.5 * (2 ** attempt))
+    log.error("sync channel: после 3 попыток сообщение не отправлено (%s)", type(last_error).__name__ if last_error else "unknown")
+    return False
 
 
 async def request_from_user(uid, plan_id):
@@ -404,6 +445,35 @@ async def request_from_user(uid, plan_id):
 
 async def finish_result(uid, plan_id, result, grant_id):
     return await send_channel(f"/payment_result {uid} {plan_id} {result} {grant_id} {sign('result', uid, plan_id, result, grant_id)}")
+
+
+async def finish_audit(uid, plan_id, grant_id, username="-"):
+    """Post-approval audit: does not block the fast checkout path."""
+    if plan_id not in PLANS:
+        return False
+    username = re.sub(r"[^A-Za-z0-9_]", "", str(username or "")) or "-"
+    signature = sign("audit", uid, plan_id, grant_id, username)
+    return await send_channel(f"/payment_audit {uid} {plan_id} {grant_id} {username} {signature}")
+
+
+async def send_owner_audit_evidence(uid, plan_id, grant_id, payment_file_id="", profile_file_id=""):
+    """Send the original evidence to the owner for a post-approval spot check."""
+    if plan_id not in PLANS:
+        return
+    cfg = PLANS[plan_id]
+    caption = (f"🧾 <b>Материалы дополнительной проверки</b>\n"
+               f"Заявка: <code>{html.escape(str(grant_id))}</code>\n"
+               f"Пользователь: <code>{uid}</code>\n"
+               f"Тариф: {html.escape(cfg['name'])} · {cfg['stars']}⭐")
+    try:
+        if payment_file_id:
+            await bot.send_photo(OWNER_ID, payment_file_id, caption=caption, parse_mode="HTML")
+        if profile_file_id:
+            await bot.send_photo(OWNER_ID, profile_file_id,
+                                 caption=f"👤 Второй скрин · заявка <code>{html.escape(str(grant_id))}</code>",
+                                 parse_mode="HTML")
+    except Exception as e:
+        log.warning("Не удалось отправить владельцу скриншоты для аудита %s: %s", grant_id, type(e).__name__)
 
 
 async def finish_service_result(uid, service_key, result, grant_id, request_id=""):
@@ -691,7 +761,10 @@ async def payment_photo(message: types.Message, state: FSMContext):
     if plan not in PLANS and plan not in PAID_SERVICE_PLANS:
         await state.clear()
         return await message.answer("⚠️ Сессия устарела. Начни заново: /start")
-    b64 = await photo_b64(message)
+    try:
+        b64 = await photo_b64(message)
+    except ValueError as e:
+        return await message.answer(f"❌ {html.escape(str(e))}")
     allowed, reason = guard_status(message.from_user.id, b64, cooldown=(plan not in PAID_SERVICE_PLANS))
     if not allowed:
         return await message.answer(reason, parse_mode="HTML")
@@ -711,7 +784,10 @@ async def profile_photo(message: types.Message, state: FSMContext):
     if plan not in PLANS and plan not in PAID_SERVICE_PLANS or not payment_b64:
         await state.clear()
         return await message.answer("⚠️ Сессия устарела, скрины не сохранены. Начни заново: /start")
-    profile_b64 = await photo_b64(message)
+    try:
+        profile_b64 = await photo_b64(message)
+    except ValueError as e:
+        return await message.answer(f"❌ {html.escape(str(e))}")
     if payment_hash(profile_b64) == payment_hash(payment_b64):
         return await message.answer("❌ Оба скрина одинаковые. Пришли отдельно скрин чека и скрин профиля получателя.")
 
@@ -726,7 +802,9 @@ async def profile_photo(message: types.Message, state: FSMContext):
 
     msg = await message.answer("⏳ <i>Проверяю подарок, получателя, время и профиль по 2 скринам и эталонам…</i>", parse_mode="HTML")
     try:
-        result = await analyze_two_images(payment_b64, profile_b64, plan, data.get("tz_offset", 3), data.get("tz_name", "UTC+3"))
+        async with verification_semaphore:
+            result = await analyze_two_images(payment_b64, profile_b64, plan,
+                                              data.get("tz_offset", 3), data.get("tz_name", "UTC+3"))
         decision = str(result.get("decision", "")).lower()
         needs_manual = bool(result.get("needs_manual_review")) or decision in {"manual", "review", "uncertain"}
 
@@ -761,6 +839,14 @@ async def profile_photo(message: types.Message, state: FSMContext):
                     "💳 Проверка пройдена, но результат не удалось передать в BotHost.\n\n"
                     "Повторно подарок не отправляй — напиши владельцу, он начислит вручную.", parse_mode="HTML")
             await commit_approved_payment(message.from_user.id, payment_b64, plan, grant_id)
+            if plan in PLANS:
+                if not await finish_audit(message.from_user.id, plan, grant_id, message.from_user.username or "-"):
+                    log.error("Не удалось отправить владельцу дополнительную проверку оплаты: uid=%s grant=%s",
+                              message.from_user.id, grant_id)
+                await send_owner_audit_evidence(
+                    message.from_user.id, plan, grant_id,
+                    data.get("payment_file_id", ""), message.photo[-1].file_id
+                )
             if plan in PAID_SERVICE_PLANS and data.get("request_id") in service_requests:
                 service_requests[data["request_id"]]["status"] = "approved"
                 save_service_requests()
@@ -786,6 +872,8 @@ async def open_manual_review(message, state, data, plan, payment_b64, profile_b6
     review_id = uuid4().hex
     manual_reviews[review_id] = {
         "uid": message.from_user.id, "plan": plan,
+        "username": message.from_user.username or "-",
+        "full_name": message.from_user.full_name or "",
         "payment_file_id": data.get("payment_file_id"), "profile_file_id": message.photo[-1].file_id,
         "payment_hash": payment_hash(payment_b64), "profile_hash": profile_hash,
         "reason": reason, "request_id": data.get("request_id", ""),
@@ -962,6 +1050,14 @@ async def approve_review(review) -> tuple[bool, str]:
         if not ok:
             return False, "BotHost недоступен — заявка осталась в ожидании"
         await commit_approved_payment(review["uid"], review["payment_hash"], plan, grant_id)
+        if plan in PLANS:
+            if not await finish_audit(review["uid"], plan, grant_id, review.get("username", "-")):
+                log.error("Не удалось отправить владельцу дополнительную проверку оплаты: uid=%s grant=%s",
+                          review["uid"], grant_id)
+            await send_owner_audit_evidence(
+                review["uid"], plan, grant_id,
+                review.get("payment_file_id", ""), review.get("profile_file_id", "")
+            )
         if plan in PAID_SERVICE_PLANS and review.get("request_id") in service_requests:
             service_requests[review["request_id"]]["status"] = "approved"
             save_service_requests()
@@ -1214,7 +1310,7 @@ async def main():
     if prune_state():
         log.info("🧹 Старые заявки вычищены")
     try:
-        await bot.delete_webhook(drop_pending_updates=True)
+        await bot.delete_webhook(drop_pending_updates=False)
     except Exception as e:
         log.warning("delete_webhook: %s", e)
     while True:

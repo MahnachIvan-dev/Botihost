@@ -1,5 +1,5 @@
 """
-🤖 BotHost v9.3 — Subscriptions Edition
+🤖 BotHost v9.8 — Subscriptions Edition
 ────────────────────────────────────────────────────────────────
 Что изменилось по сравнению с v8.0:
 
@@ -59,6 +59,7 @@ import shutil
 import time
 import atexit
 import threading
+import tempfile
 import hmac
 import hashlib
 import json
@@ -68,6 +69,7 @@ import uuid
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Dict
+from collections import deque
 
 from aiogram import Bot, Dispatcher, types, F, BaseMiddleware
 from aiogram.exceptions import (TelegramConflictError, TelegramUnauthorizedError, TelegramRetryAfter,
@@ -121,7 +123,7 @@ elif _cashier_env in ("0", "false", "no", "off", "выкл"):
 else:
     INTERNAL_CASHIER_MODE = "auto"
 INTERNAL_CASHIER = INTERNAL_CASHIER_MODE  # для обратной совместимости и логов
-BOTHOST_VERSION = "9.7"
+BOTHOST_VERSION = "9.8"
 
 DATA_DIR = Path(os.environ.get("DATA_DIR", "/app/data"))
 BOTS_DIR = DATA_DIR / "bots"
@@ -230,6 +232,11 @@ bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
 running_bots: Dict[int, subprocess.Popen] = {}
 start_locks: Dict[int, asyncio.Lock] = {}
+MAX_PARALLEL_STARTS = max(1, min(4, int(os.environ.get("MAX_PARALLEL_STARTS", "2"))))
+start_semaphore = asyncio.Semaphore(MAX_PARALLEL_STARTS)
+archive_semaphore = asyncio.Semaphore(1)
+restart_history: Dict[int, list] = {}
+restart_tasks: Dict[int, asyncio.Task] = {}
 
 groq_client = None
 if GROQ_AVAILABLE and GROQ_API_KEY:
@@ -278,6 +285,26 @@ def _db_retry(fn, attempts=10):
     raise last
 
 
+def create_sqlite_snapshot(destination: Path):
+    """Create a consistent SQLite backup, including committed WAL state."""
+    source = target = None
+    try:
+        source = sqlite3.connect(DB_PATH, timeout=15)
+        target = sqlite3.connect(destination, timeout=15)
+        source.execute("PRAGMA busy_timeout=15000")
+        source.backup(target)
+        target.commit()
+        check = target.execute("PRAGMA integrity_check").fetchone()
+        if not check or check[0] != "ok":
+            raise RuntimeError("SQLite backup failed integrity_check.")
+    finally:
+        if target:
+            target.close()
+        if source:
+            source.close()
+    return destination
+
+
 def _db_read(fn):
     conn = _db_connect()
     try:
@@ -307,6 +334,18 @@ def init_db():
         c.execute("CREATE TABLE IF NOT EXISTS promocodes (id INTEGER PRIMARY KEY AUTOINCREMENT, code TEXT UNIQUE, plan TEXT, uses_left INTEGER, created_at TEXT)")
         c.execute("CREATE TABLE IF NOT EXISTS used_promos (user_id INTEGER, promo_id INTEGER, UNIQUE(user_id, promo_id))")
         c.execute("CREATE TABLE IF NOT EXISTS auto_grants (grant_id TEXT PRIMARY KEY, user_id INTEGER NOT NULL, plan TEXT NOT NULL, created_at TEXT NOT NULL)")
+        c.execute("""CREATE TABLE IF NOT EXISTS payment_audits (
+            grant_id TEXT PRIMARY KEY, user_id INTEGER NOT NULL, username TEXT DEFAULT '',
+            plan TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending',
+            created_at TEXT NOT NULL, decided_at TEXT, decided_by INTEGER, action_note TEXT DEFAULT '',
+            owner_notified_at TEXT, owner_notify_attempts INTEGER NOT NULL DEFAULT 0
+        )""")
+        audit_cols = {row[1] for row in c.execute("PRAGMA table_info(payment_audits)").fetchall()}
+        if "owner_notified_at" not in audit_cols:
+            c.execute("ALTER TABLE payment_audits ADD COLUMN owner_notified_at TEXT")
+        if "owner_notify_attempts" not in audit_cols:
+            c.execute("ALTER TABLE payment_audits ADD COLUMN owner_notify_attempts INTEGER NOT NULL DEFAULT 0")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_payment_audits_user ON payment_audits(user_id, created_at DESC)")
         c.execute("CREATE TABLE IF NOT EXISTS bot_archives (id INTEGER PRIMARY KEY AUTOINCREMENT, bot_id INTEGER NOT NULL, message_id INTEGER NOT NULL, file_id TEXT NOT NULL, filename TEXT NOT NULL, created_at TEXT NOT NULL)")
         c.execute("CREATE INDEX IF NOT EXISTS idx_bot_archives_bot ON bot_archives(bot_id, id DESC)")
 
@@ -359,19 +398,41 @@ def swap_database_file(tmp_db: Path):
 
     Возвращает имя страховочной копии или "".
     """
-    chk = sqlite3.connect(tmp_db)
+    chk = sqlite3.connect(tmp_db, timeout=10)
     try:
+        integrity = chk.execute("PRAGMA integrity_check").fetchone()
+        if not integrity or integrity[0] != "ok":
+            raise ValueError("Загруженный файл не прошёл SQLite integrity_check.")
         chk.execute("SELECT count(*) FROM sqlite_master").fetchone()
     finally:
         chk.close()
     safety_name = ""
     if DB_PATH.exists():
         safety_path = DATA_DIR / f"backup_before_restore_{datetime.now().strftime('%Y%m%d_%H%M%S')}.db"
-        shutil.copy2(DB_PATH, safety_path)
+        # Use SQLite's online backup API so the safety copy includes committed WAL data.
+        src = sqlite3.connect(DB_PATH, timeout=15)
+        dst = sqlite3.connect(safety_path, timeout=15)
+        try:
+            src.execute("PRAGMA busy_timeout=15000")
+            src.backup(dst)
+            check = dst.execute("PRAGMA integrity_check").fetchone()
+            if not check or check[0] != "ok":
+                raise RuntimeError("Не удалось проверить резервную копию текущей базы.")
+        finally:
+            dst.close()
+            src.close()
         safety_name = safety_path.name
+    # The event loop performs this operation synchronously; checkpoint WAL before replacing the DB.
+    if DB_PATH.exists():
+        checkpoint = sqlite3.connect(DB_PATH, timeout=15)
+        try:
+            checkpoint.execute("PRAGMA busy_timeout=15000")
+            checkpoint.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        finally:
+            checkpoint.close()
     for sfx in ("-wal", "-shm"):
         Path(str(DB_PATH) + sfx).unlink(missing_ok=True)
-    shutil.move(str(tmp_db), str(DB_PATH))
+    os.replace(str(tmp_db), str(DB_PATH))
     init_db()
     return safety_name
 
@@ -638,6 +699,20 @@ def get_limits(uid):
     return {"unlimited": False, "slots": len(bot_subs), "until": until, "host": False, "vip": False, "admin": False, "subs": subs}
 
 
+def user_payment_hold(uid):
+    """True while the owner has confirmed an unpaid cashier order."""
+    try:
+        row = _db_read(lambda conn: conn.execute(
+            "SELECT 1 FROM payment_audits WHERE user_id=? AND status='confirmed_unpaid' LIMIT 1",
+            (uid,)
+        ).fetchone())
+        return bool(row)
+    except sqlite3.Error:
+        # Fail closed if payment audit state cannot be read.
+        logger.exception("Не удалось проверить блокировку оплаты пользователя %s", uid)
+        return True
+
+
 def has_active_slot(uid):
     """Есть ли вообще право запускать ботов (с учётом льготного периода и безлимита)."""
     if is_admin(uid) or is_vip(uid):
@@ -650,6 +725,8 @@ def has_active_slot(uid):
 
 def can_add_bot(uid):
     """Можно ли загрузить ещё одного бота. → (bool, причина)"""
+    if user_payment_hold(uid) and uid != OWNER_ID:
+        return False, "доступ временно заморожен владельцем из-за неподтверждённой оплаты"
     if is_admin(uid) or is_vip(uid):
         return True, ""
     lim = get_limits(uid)
@@ -939,9 +1016,35 @@ def bot_status_emoji(b):
 # 🛡 ГЛОБАЛЬНЫЙ БАН
 # ═══════════════════════════════════════════════════════════════
 
+_rate_buckets = {}
+_rate_notice_at = {}
+RATE_LIMIT_EVENTS = max(10, min(100, int(os.environ.get("RATE_LIMIT_EVENTS", "25"))))
+RATE_LIMIT_WINDOW = max(3, min(60, int(os.environ.get("RATE_LIMIT_WINDOW", "10"))))
+
+
 class BanMiddleware(BaseMiddleware):
     async def __call__(self, handler, event, data):
         u = data.get("event_from_user")
+        if u and u.id != OWNER_ID:
+            now = time.monotonic()
+            if len(_rate_buckets) > 10000:
+                for old_uid, old_bucket in list(_rate_buckets.items()):
+                    if not old_bucket or now - old_bucket[-1] > RATE_LIMIT_WINDOW:
+                        _rate_buckets.pop(old_uid, None)
+                        _rate_notice_at.pop(old_uid, None)
+            bucket = _rate_buckets.setdefault(u.id, deque())
+            while bucket and now - bucket[0] > RATE_LIMIT_WINDOW:
+                bucket.popleft()
+            if len(bucket) >= RATE_LIMIT_EVENTS:
+                last_notice = _rate_notice_at.get(u.id, 0)
+                if now - last_notice > 10 and isinstance(event, types.Message):
+                    _rate_notice_at[u.id] = now
+                    try:
+                        await event.answer("⏳ Слишком много действий подряд. Подожди немного и попробуй снова.")
+                    except Exception:
+                        pass
+                return
+            bucket.append(now)
         if u and is_user_banned(u.id):
             if isinstance(event, types.Message):
                 await event.answer("🚫 <b>Вы заблокированы на хостинге.</b>", parse_mode="HTML")
@@ -959,12 +1062,36 @@ dp.callback_query.middleware(BanMiddleware())
 # ═══════════════════════════════════════════════════════════════
 
 WRAPPER_CODE = r'''#!/usr/bin/env python3
-import os, sys, subprocess, time, signal, hashlib, re, venv, json
+import os, sys, subprocess, time, signal, hashlib, re, venv, json, shutil
+try:
+    import fcntl
+except ImportError:
+    fcntl = None
+
+def pip_run(args, **kwargs):
+    """Serialize pip writes across user projects to avoid concurrent disk/cache spikes."""
+    lock = open(os.path.join("/tmp", "bothost-pip-install.lock"), "a")
+    try:
+        if fcntl is not None:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        return subprocess.run(args, **kwargs)
+    finally:
+        if fcntl is not None:
+            try:
+                fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+            except Exception:
+                pass
+        lock.close()
+
 ENTRY_POINT = "{{ENTRY_POINT}}"
 print(f"\n[ BotHost ] Подготовка проекта... Точка входа: {ENTRY_POINT}", flush=True)
 VENV_DIR = ".venv"
 PYBIN = os.path.join(VENV_DIR, "bin", "python") if os.name != "nt" else os.path.join(VENV_DIR, "Scripts", "python.exe")
 if not os.path.exists(PYBIN):
+    free_bytes = shutil.disk_usage(".").free
+    if free_bytes < 256 * 1024 * 1024:
+        print("[ BotHost ] Недостаточно свободного места для создания окружения (нужно не менее 256 МБ).", flush=True)
+        sys.exit(28)
     print("[ BotHost ] Создаю изолированное окружение...", flush=True)
     venv.EnvBuilder(with_pip=True).create(VENV_DIR)
 req_files=[]
@@ -982,8 +1109,11 @@ req_hash=digest.hexdigest(); marker=".requirements.installed"
 old_hash=open(marker,encoding="utf-8").read().strip() if os.path.exists(marker) else ""
 if req_files and req_hash != old_hash:
     for rf in req_files:
+        if shutil.disk_usage(".").free < 256 * 1024 * 1024:
+            print("[ BotHost ] Недостаточно свободного места для установки зависимостей (нужно не менее 256 МБ).", flush=True)
+            sys.exit(28)
         print(f"[ BotHost ] Устанавливаю зависимости: {rf}", flush=True)
-        r=subprocess.run([PYBIN,"-m","pip","install","-r",rf,"--no-cache-dir","--disable-pip-version-check"])
+        r=pip_run([PYBIN,"-m","pip","install","-r",rf,"--no-cache-dir","--disable-pip-version-check"], timeout=300)
         if r.returncode: sys.exit(r.returncode)
     open(marker,"w",encoding="utf-8").write(req_hash)
 IMPORT_TO_PACKAGE={"telegram":"python-telegram-bot","PIL":"Pillow","cv2":"opencv-python","bs4":"beautifulsoup4","dotenv":"python-dotenv","yaml":"PyYAML","Crypto":"pycryptodome","dateutil":"python-dateutil","jwt":"PyJWT","multipart":"python-multipart","fitz":"PyMuPDF","openai":"openai","groq":"groq","aiogram":"aiogram","discord":"discord.py","requests":"requests","aiohttp":"aiohttp","flask":"flask","fastapi":"fastapi","uvicorn":"uvicorn","pydantic":"pydantic","sqlalchemy":"sqlalchemy","redis":"redis","pymongo":"pymongo"}
@@ -995,8 +1125,8 @@ def ensure_telegram_package():
         import telegram
         if not hasattr(telegram, "Bot"):
             print("[ BotHost ] Обнаружен неправильный пакет telegram; заменяю на python-telegram-bot...", flush=True)
-            subprocess.run([PYBIN,"-m","pip","uninstall","-y","telegram"], stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT)
-            r=subprocess.run([PYBIN,"-m","pip","install","python-telegram-bot","--no-cache-dir","--disable-pip-version-check"])
+            pip_run([PYBIN,"-m","pip","uninstall","-y","telegram"], stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT, timeout=60)
+            r=pip_run([PYBIN,"-m","pip","install","python-telegram-bot","--no-cache-dir","--disable-pip-version-check"], timeout=180)
             if r.returncode:
                 print("[ BotHost ] Не удалось установить python-telegram-bot", flush=True)
                 sys.exit(r.returncode)
@@ -1038,7 +1168,7 @@ while attempt<4:
     if not missing: sys.exit(ret)
     package=IMPORT_TO_PACKAGE.get(missing,missing)
     print(f"[ BotHost ] Не хватает {missing}; устанавливаю {package}...",flush=True)
-    r=subprocess.run([PYBIN,"-m","pip","install",package,"--no-cache-dir","--disable-pip-version-check"])
+    r=pip_run([PYBIN,"-m","pip","install",package,"--no-cache-dir","--disable-pip-version-check"], timeout=180)
     if r.returncode: sys.exit(ret)
 sys.exit(ret)
 '''
@@ -1048,7 +1178,19 @@ def write_wrapper(bot_dir, entry_point):
     (bot_dir / "wrapper.py").write_text(WRAPPER_CODE.replace("{{ENTRY_POINT}}", entry_point), encoding="utf-8")
 
 
-async def archive_bot_files(bot_id: int):
+def build_bot_archive(bot_dir: Path, target_zip: Path):
+    """CPU/disk-heavy archive work; called in a worker thread."""
+    with zipfile.ZipFile(target_zip, "w", zipfile.ZIP_DEFLATED) as z:
+        for root, dirs, files in os.walk(bot_dir, followlinks=False):
+            dirs[:] = [d for d in dirs if d not in ARCHIVE_EXCLUDE_DIRS and not Path(root, d).is_symlink()]
+            for name in files:
+                if name in ARCHIVE_EXCLUDE_FILES or Path(root, name).is_symlink():
+                    continue
+                fp = Path(root) / name
+                z.write(fp, fp.relative_to(bot_dir).as_posix())
+
+
+async def _archive_bot_files_unlocked(bot_id: int):
     """Сохраняет актуальные файлы бота в Telegram Storage Channel."""
     if not FILE_STORAGE_CHANNEL_ID:
         logger.warning("BOT_FILES_STORAGE_CHANNEL_ID/STORAGE_CHANNEL_ID не задан — архив #%s только локальный", bot_id)
@@ -1056,18 +1198,18 @@ async def archive_bot_files(bot_id: int):
     bot_dir = BOTS_DIR / f"bot_{bot_id}"
     if not bot_dir.exists():
         return False
-    tmp = DATA_DIR / f"bot_{bot_id}_{int(time.time())}.zip"
+    project_bytes = directory_size(bot_dir)
+    if project_bytes > MAX_PROJECT_BYTES:
+        logger.error("Архив #%s не создан: размер проекта превышает лимит %s МБ", bot_id, MAX_PROJECT_BYTES // (1024*1024))
+        return False
+    if shutil.disk_usage(DATA_DIR).free < project_bytes + MIN_FREE_DISK_BYTES:
+        logger.warning("Архив #%s не создан: мало свободного места на диске", bot_id)
+        return False
+    tmp = DATA_DIR / f"bot_{bot_id}_{uuid.uuid4().hex}.zip"
     try:
-        with zipfile.ZipFile(tmp, "w", zipfile.ZIP_DEFLATED) as z:
-            for root, dirs, files in os.walk(bot_dir):
-                dirs[:] = [d for d in dirs if d not in {"__pycache__", ".venv", ".git"}]
-                for name in files:
-                    if name in {"wrapper.py", "bot.log", ".requirements.installed"}:
-                        continue
-                    fp = Path(root) / name
-                    z.write(fp, fp.relative_to(bot_dir).as_posix())
-        if tmp.stat().st_size > 49 * 1024 * 1024:
-            logger.error("Архив бота #%s слишком большой для Telegram: %s bytes", bot_id, tmp.stat().st_size)
+        await asyncio.to_thread(build_bot_archive, bot_dir, tmp)
+        if tmp.stat().st_size > MAX_TELEGRAM_ARCHIVE_BYTES:
+            logger.error("Архив бота #%s превышает лимит Telegram: %s bytes (максимум %s)", bot_id, tmp.stat().st_size, MAX_TELEGRAM_ARCHIVE_BYTES)
             return False
         b = get_bot(bot_id)
         ep = (b[7] if b and len(b) > 7 else "") or find_entry_point(bot_dir)
@@ -1093,56 +1235,85 @@ async def archive_bot_files(bot_id: int):
             pass
 
 
+async def archive_bot_files(bot_id: int):
+    """Serialize archive creation to avoid concurrent CPU/disk spikes."""
+    async with archive_semaphore:
+        return await _archive_bot_files_unlocked(bot_id)
+
+
 async def restore_bot_files(bot_id: int):
-    """Восстанавливает последнюю архивную версию файлов из Telegram."""
+    """Восстанавливает архив без удаления текущего проекта до успешной проверки ZIP."""
     bot_dir = BOTS_DIR / f"bot_{bot_id}"
-    archives = _db_read(lambda conn: conn.execute("SELECT file_id FROM bot_archives WHERE bot_id=? ORDER BY id DESC LIMIT 1", (bot_id,)).fetchone())
+    archives = _db_read(lambda conn: conn.execute(
+        "SELECT file_id FROM bot_archives WHERE bot_id=? ORDER BY id DESC LIMIT 1", (bot_id,)
+    ).fetchone())
     if not archives:
         return False
     file_id = archives[0]
     tmp = DATA_DIR / f"restore_bot_{bot_id}_{uuid.uuid4().hex}.zip"
+    stage = BOTS_DIR / f".restore_stage_{bot_id}_{uuid.uuid4().hex}"
+    backup = BOTS_DIR / f".restore_backup_{bot_id}_{uuid.uuid4().hex}"
+    swapped_old = False
+    swapped_new = False
     try:
         info = await bot.get_file(file_id)
+        if info.file_size and info.file_size > MAX_TELEGRAM_ARCHIVE_BYTES:
+            raise ValueError("Архив восстановления превышает допустимый размер Telegram.")
         await bot.download_file(info.file_path, destination=tmp)
-        bot_dir.mkdir(parents=True, exist_ok=True)
-        for child in list(bot_dir.iterdir()):
-            if child.name in {"bot.log"}:
-                continue
-            if child.is_dir():
-                shutil.rmtree(child, ignore_errors=True)
-            else:
-                try:
-                    child.unlink()
-                except Exception:
-                    pass
+        if tmp.stat().st_size > MAX_TELEGRAM_ARCHIVE_BYTES:
+            raise ValueError("Скачанный архив восстановления превышает лимит.")
+        stage.mkdir(parents=True, exist_ok=False)
         with zipfile.ZipFile(tmp, "r") as z:
-            safe_extract_zip(z, bot_dir)
-        # ВАЖНО: не перезаписываем выбранную пользователем точку входа. Раньше здесь
-        # стоял find_entry_point(), и после восстановления из архива точка входа
-        # подменялась «первым по алфавиту» файлом (например apscheduler.py) — бот
-        # перестарался запускаться.
+            await asyncio.to_thread(safe_extract_zip, z, stage)
+        # Keep the current log for diagnostics; archive intentionally excludes it.
+        old_log = bot_dir / "bot.log"
+        if old_log.is_file() and not old_log.is_symlink():
+            shutil.copy2(old_log, stage / "bot.log")
+        if not get_python_files(stage):
+            raise ValueError("В архиве не найдено ни одного Python-файла.")
+        # Stop before swapping files so no process keeps executing a replaced script.
+        if bot_id in running_bots:
+            await stop_user_bot(bot_id)
+        if bot_dir.exists():
+            os.replace(bot_dir, backup)
+            swapped_old = True
+        os.replace(stage, bot_dir)
+        swapped_new = True
         b = get_bot(bot_id)
         stored = b[7] if b and len(b) > 7 else ""
         ep, fixed = resolve_entry_point(bot_id, bot_dir, stored)
+        if not ep:
+            raise ValueError("После восстановления не удалось определить точку входа.")
+        write_wrapper(bot_dir, ep)
         logger.info("♻️ Файлы бота #%s восстановлены из Telegram Storage (точка входа: %s%s)",
                     bot_id, ep or "не найдена", ", исправлена" if fixed else "")
+        shutil.rmtree(backup, ignore_errors=True)
         return True
     except Exception as e:
+        # If the swap failed, restore the original directory before returning.
+        if swapped_old and backup.exists():
+            try:
+                if bot_dir.exists():
+                    shutil.rmtree(bot_dir, ignore_errors=True)
+                os.replace(backup, bot_dir)
+            except Exception:
+                logger.exception("КРИТИЧЕСКИ: не удалось вернуть исходные файлы бота #%s", bot_id)
+        elif swapped_new and bot_dir.exists():
+            shutil.rmtree(bot_dir, ignore_errors=True)
         logger.warning("Не удалось восстановить файлы бота #%s: %s", bot_id, e)
         return False
     finally:
-        try:
-            tmp.unlink()
-        except FileNotFoundError:
-            pass
+        tmp.unlink(missing_ok=True)
+        shutil.rmtree(stage, ignore_errors=True)
+        # Do not delete backup here: on an unexpected rollback failure it is the only copy.
 
 
 async def start_user_bot(bot_id):
     lock = start_locks.setdefault(bot_id, asyncio.Lock())
-    async with lock:
+    async with lock, start_semaphore:
         try:
             b = get_bot(bot_id)
-            if not b or b[6] == 1:
+            if not b or b[6] == 1 or (user_payment_hold(b[1]) and b[1] != OWNER_ID):
                 return False
             current = running_bots.get(bot_id)
             if current and current.poll() is None:
@@ -1188,8 +1359,12 @@ async def start_user_bot(bot_id):
             env["BOTHOST_USER_ENV"] = json.dumps(user_env, ensure_ascii=False)
             env["PYTHONUNBUFFERED"] = "1"
             lf = open(log_file, "a", encoding="utf-8")
-            proc = subprocess.Popen([sys.executable, "-u", "wrapper.py"], cwd=str(bot_dir), env=env,
-                                    stdout=lf, stderr=subprocess.STDOUT, start_new_session=True)
+            try:
+                proc = subprocess.Popen([sys.executable, "-u", "wrapper.py"], cwd=str(bot_dir), env=env,
+                                        stdout=lf, stderr=subprocess.STDOUT, start_new_session=True)
+            finally:
+                # The child process owns its redirected descriptor; don't leak one FD per launch.
+                lf.close()
             running_bots[bot_id] = proc
             await asyncio.sleep(4)
             if proc.poll() is not None:
@@ -1211,10 +1386,14 @@ async def stop_user_bot(bot_id):
         if proc:
             try:
                 os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
-                proc.wait(timeout=3)
+                await asyncio.to_thread(proc.wait, timeout=3)
             except Exception:
                 try:
                     os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+                except Exception:
+                    pass
+                try:
+                    await asyncio.to_thread(proc.wait, timeout=2)
                 except Exception:
                     pass
         try:
@@ -1265,6 +1444,31 @@ def crash_hint(bot_id, code, logs=""):
     return text + "\n"
 
 
+def trim_bot_log(log_path: Path) -> None:
+    """Keep only the tail of an oversized bot log after its process has stopped."""
+    try:
+        if not log_path.is_file() or log_path.stat().st_size <= MAX_BOT_LOG_BYTES:
+            return
+        with open(log_path, "rb") as f:
+            f.seek(max(0, log_path.stat().st_size - BOT_LOG_KEEP_BYTES))
+            tail = f.read(BOT_LOG_KEEP_BYTES)
+        with open(log_path, "wb") as f:
+            f.write("[BotHost] Старые логи обрезаны из-за ограничения размера.\n".encode("utf-8"))
+            f.write(tail)
+    except OSError:
+        logger.exception("Не удалось ограничить размер лога %s", log_path)
+
+
+async def delayed_bot_restart(bot_id: int, delay: float):
+    try:
+        await asyncio.sleep(delay)
+        await start_user_bot(bot_id)
+    finally:
+        task = restart_tasks.get(bot_id)
+        if task is asyncio.current_task():
+            restart_tasks.pop(bot_id, None)
+
+
 async def monitor_bots():
     while True:
         try:
@@ -1283,12 +1487,26 @@ async def monitor_bots():
                     if row:
                         uid, auto_restart = row
                         if auto_restart == 1 and not is_user_banned(uid):
-                            try:
-                                await bot.send_message(uid, f"⚠️ <b>Бот #{bot_id} упал!</b>\n🔄 <i>Авто-рестарт включён, пытаюсь поднять...</i>", parse_mode="HTML")
-                            except Exception:
-                                pass
-                            await asyncio.sleep(5)
-                            await start_user_bot(bot_id)
+                            now_ts = time.time()
+                            recent = [t for t in restart_history.get(bot_id, []) if now_ts - t < 600]
+                            if len(recent) >= 3:
+                                restart_history[bot_id] = recent
+                                logger.error("Авто-рестарт #%s приостановлен: 3 падения за 10 минут", bot_id)
+                                try:
+                                    await bot.send_message(uid, f"🛑 <b>Авто-рестарт бота #{bot_id} приостановлен</b>\nТри падения за 10 минут. Проверь логи перед новым запуском.", parse_mode="HTML")
+                                except Exception:
+                                    pass
+                            else:
+                                recent.append(now_ts)
+                                restart_history[bot_id] = recent
+                                try:
+                                    await bot.send_message(uid, f"⚠️ <b>Бот #{bot_id} упал!</b>\n🔄 Попытка авто-рестарта {len(recent)}/3...", parse_mode="HTML")
+                                except Exception:
+                                    pass
+                                delay = min(5 * (2 ** (len(recent) - 1)), 30)
+                                pending_task = restart_tasks.get(bot_id)
+                                if pending_task is None or pending_task.done():
+                                    restart_tasks[bot_id] = asyncio.create_task(delayed_bot_restart(bot_id, delay))
                         else:
                             if uid != OWNER_ID:
                                 logs = get_bot_logs(bot_id, 15)
@@ -1298,19 +1516,44 @@ async def monitor_bots():
                                 except Exception:
                                     pass
                 else:
+                    log_path = BOTS_DIR / f"bot_{bot_id}" / "bot.log"
+                    try:
+                        log_size = log_path.stat().st_size if log_path.is_file() else 0
+                    except OSError:
+                        log_size = 0
+                    if log_size > MAX_BOT_LOG_BYTES:
+                        b_log = get_bot(bot_id)
+                        await stop_user_bot(bot_id)
+                        trim_bot_log(log_path)
+                        logger.warning("Бот #%s остановлен: лог превысил лимит %s МБ", bot_id, MAX_BOT_LOG_BYTES // (1024*1024))
+                        if b_log:
+                            try:
+                                await bot.send_message(b_log[1],
+                                    f"🛑 Бот #{bot_id} остановлен: лог превысил лимит "
+                                    f"{MAX_BOT_LOG_BYTES // (1024*1024)} МБ. Лог сокращён, файлы проекта сохранены. "
+                                    "Проверь, не пишет ли бот ошибку в бесконечном цикле.")
+                            except Exception:
+                                pass
+                        continue
                     b = get_bot(bot_id)
-                    if b and (b[6] == 1 or is_user_banned(b[1]) or (b[1] != OWNER_ID and not is_admin(b[1]) and not has_active_slot(b[1]))):
+                    if b and (b[6] == 1 or is_user_banned(b[1]) or user_payment_hold(b[1]) or (b[1] != OWNER_ID and not is_admin(b[1]) and not has_active_slot(b[1]))):
                         await stop_user_bot(bot_id)
                         if b[1] != OWNER_ID and not is_admin(b[1]):
                             try:
-                                await bot.send_message(
-                                    b[1],
-                                    f"⏸ <b>Бот #{bot_id} остановлен</b>\n\n"
-                                    "📦 Подписка истекла (льготные 24 ч закончились).\n"
-                                    "Продли — и бот снова поднимется с теми же файлами.",
-                                    reply_markup=renew_kb("bot"),
-                                    parse_mode="HTML"
-                                )
+                                if user_payment_hold(b[1]):
+                                    notice = (f"⏸ <b>Бот #{bot_id} заморожен</b>\n\n"
+                                              "Владелец подтвердил, что оплата по одной из заявок не поступила. "
+                                              "Файлы сохранены. Напиши владельцу для проверки.")
+                                    await bot.send_message(b[1], notice, parse_mode="HTML")
+                                else:
+                                    await bot.send_message(
+                                        b[1],
+                                        f"⏸ <b>Бот #{bot_id} остановлен</b>\n\n"
+                                        "📦 Подписка истекла (льготные 24 ч закончились).\n"
+                                        "Продли — и бот снова поднимется с теми же файлами.",
+                                        reply_markup=renew_kb("bot"),
+                                        parse_mode="HTML"
+                                    )
                             except Exception:
                                 pass
         except Exception:
@@ -1387,10 +1630,87 @@ async def monitor_subscriptions():
 
 async def bootstrap_bot_archives():
     """После обновления BotHost один раз создаёт архивы для старых локальных ботов."""
+    if not FILE_STORAGE_CHANNEL_ID:
+        logger.warning("Архивация пропущена: не задан BOT_FILES_STORAGE_CHANNEL_ID/STORAGE_CHANNEL_ID.")
+        return
     for b in get_all_bots():
         exists = _db_read(lambda conn, bid=b[0]: conn.execute("SELECT 1 FROM bot_archives WHERE bot_id=? LIMIT 1", (bid,)).fetchone())
         if not exists and get_python_files(BOTS_DIR / f"bot_{b[0]}"):
             await archive_bot_files(b[0])
+
+
+async def reconcile_payment_audit_holds():
+    """Repair payment freezes after crashes and correctly handle overlapping audit holds."""
+    rows = _db_read(lambda conn: conn.execute(
+        "SELECT grant_id,user_id,status,action_note FROM payment_audits "
+        "WHERE status IN ('confirmed_unpaid','released') ORDER BY created_at ASC"
+    ).fetchall())
+    parsed = []
+    for grant_id, uid, status, action_note in rows:
+        try:
+            details = json.loads(action_note or "{}")
+            if not isinstance(details, dict):
+                details = {}
+        except Exception:
+            details = {}
+        parsed.append((grant_id, int(uid), status, details))
+
+    # First enforce every active hold. This is idempotent and runs before user bots restore.
+    for grant_id, uid, status, details in parsed:
+        if status != "confirmed_unpaid":
+            continue
+        bot_rows = _db_read(lambda conn, user_id=uid: conn.execute(
+            "SELECT id,is_frozen FROM bots WHERE user_id=?", (user_id,)
+        ).fetchall())
+        known_ids = {int(x) for x in details.get("frozen_bot_ids", []) if str(x).isdigit()}
+        all_ids = sorted(known_ids | {int(item[0]) for item in bot_rows})
+        if "payment_frozen_bot_ids" not in details:
+            # Legacy audit rows predate the distinction between manual and payment freezes.
+            # Preserve their historic behavior; new rows record the exact set explicitly.
+            details["payment_frozen_bot_ids"] = list(all_ids)
+            details.setdefault("previously_frozen_bot_ids", [])
+        details["frozen_bot_ids"] = all_ids
+        details.setdefault("reason", "owner_confirmed_unpaid")
+        details.setdefault("previously_running_bot_ids", [])
+        for bid in all_ids:
+            _db_retry(lambda conn, bot_id=bid: conn.execute(
+                "UPDATE bots SET is_frozen=1,status='stopped' WHERE id=?", (bot_id,)
+            ))
+        _db_retry(lambda conn, g=grant_id, d=details: conn.execute(
+            "UPDATE payment_audits SET action_note=? WHERE grant_id=? AND status='confirmed_unpaid'",
+            (json.dumps(d, ensure_ascii=False), g)
+        ))
+
+    # Only release payment-created freezes when the user has no other active unpaid audit.
+    restart_by_user = {}
+    for grant_id, uid, status, details in parsed:
+        if status != "released" or user_payment_hold(uid):
+            continue
+        ids = details.get("payment_frozen_bot_ids")
+        if ids is None:
+            ids = details.get("frozen_bot_ids", [])  # compatibility with earlier audit records
+        for raw_bid in ids:
+            try:
+                bid = int(raw_bid)
+                _db_retry(lambda conn, bot_id=bid: conn.execute(
+                    "UPDATE bots SET is_frozen=0 WHERE id=?", (bot_id,)
+                ))
+            except Exception:
+                logger.exception("Не удалось восстановить состояние заморозки бота %s", raw_bid)
+        restart_by_user.setdefault(uid, set()).update(
+            int(x) for x in details.get("previously_running_bot_ids", []) if str(x).isdigit()
+        )
+
+    # Restart only bots that were running before a payment hold, and only if access is still valid.
+    for uid, bot_ids in restart_by_user.items():
+        if user_payment_hold(uid) or is_user_banned(uid) or not (uid == OWNER_ID or is_admin(uid) or has_active_slot(uid)):
+            continue
+        for bid in sorted(bot_ids):
+            try:
+                await start_user_bot(bid)
+            except Exception:
+                logger.exception("Не удалось запустить бота #%s после восстановления оплаты", bid)
+    logger.info("🛡 Состояние заморозок оплаты сверено с журналом аудита.")
 
 
 async def restore_running_bots():
@@ -1499,8 +1819,15 @@ async def auto_backup():
         await asyncio.sleep(24 * 3600)
         try:
             if os.path.exists(DB_PATH):
-                await bot.send_document(OWNER_ID, FSInputFile(DB_PATH, filename=f"bothost_backup_{datetime.now().strftime('%Y%m%d')}.db"),
-                                        caption="🔄 Автоматический бэкап базы данных.")
+                snapshot = DATA_DIR / f"auto_backup_{uuid.uuid4().hex}.db"
+                try:
+                    await asyncio.to_thread(create_sqlite_snapshot, snapshot)
+                    await bot.send_document(
+                        OWNER_ID, FSInputFile(str(snapshot), filename=f"bothost_backup_{datetime.now().strftime('%Y%m%d')}.db"),
+                        caption="🔄 Автоматический проверенный бэкап базы данных."
+                    )
+                finally:
+                    snapshot.unlink(missing_ok=True)
             for b in get_all_bots():
                 await archive_bot_files(b[0])
             removed = cleanup_subscriptions(60)
@@ -1722,6 +2049,209 @@ async def channel_payment_result(message: types.Message):
         logger.exception("payment_result error")
 
 
+async def notify_owner_payment_audit(grant_id: str, force: bool = False) -> bool:
+    """Deliver/retry the owner prompt for a pending audit, with bounded reminders."""
+    row = _db_read(lambda conn: conn.execute(
+        "SELECT user_id,username,plan,status,owner_notified_at,owner_notify_attempts "
+        "FROM payment_audits WHERE grant_id=?", (grant_id,)
+    ).fetchone())
+    if not row:
+        return False
+    uid, username, plan, status, last_sent, attempts = row
+    attempts = int(attempts or 0)
+    if status != "pending" or plan not in PLANS or attempts >= 5:
+        return False
+    now = datetime.now()
+    if last_sent and not force:
+        try:
+            if (now - datetime.fromisoformat(last_sent)).total_seconds() < 900:
+                return False
+        except Exception:
+            pass
+    cfg = PLANS[plan]
+    kb = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="✅ Да, оплатил", callback_data=f"payaudit:paid:{grant_id}"),
+        InlineKeyboardButton(text="❌ Не оплатил", callback_data=f"payaudit:unpaid:{grant_id}")
+    ]])
+    reminder = "\n\n🔔 Напоминание: решение по проверке ещё не принято." if attempts else ""
+    try:
+        await bot.send_message(
+            OWNER_ID,
+            "🛡 <b>Дополнительная проверка оплаты</b>\n\n"
+            f"👤 Пользователь: {('@' + html.escape(username)) if username else 'без username'}\n"
+            f"🆔 Telegram ID: <code>{uid}</code>\n"
+            f"🧾 Заявка: <code>{html.escape(grant_id)}</code>\n"
+            f"📦 Тариф: <b>{html.escape(cfg['name'])}</b> · {cfg['stars']}⭐\n"
+            "📌 Кассир уже одобрил заявку и передал её в BotHost.\n\n"
+            "Ты подтверждаешь, что деньги действительно поступили?" + reminder,
+            reply_markup=kb, parse_mode="HTML"
+        )
+        _db_retry(lambda conn: conn.execute(
+            "UPDATE payment_audits SET owner_notified_at=?, owner_notify_attempts=owner_notify_attempts+1 "
+            "WHERE grant_id=? AND status='pending'",
+            (now.isoformat(), grant_id)
+        ))
+        return True
+    except Exception as exc:
+        _db_retry(lambda conn: conn.execute(
+            "UPDATE payment_audits SET owner_notify_attempts=owner_notify_attempts+1 "
+            "WHERE grant_id=? AND status='pending'", (grant_id,)
+        ))
+        logger.warning("Не удалось уведомить владельца о проверке оплаты %s: %s", grant_id, type(exc).__name__)
+        return False
+
+
+@dp.channel_post(F.text.startswith("/payment_audit"))
+async def channel_payment_audit(message: types.Message):
+    """Receives a signed post-approval owner audit request from the cashier."""
+    try:
+        parts = (message.text or "").strip().split()
+        if len(parts) != 6 or not SYNC_SECRET:
+            return
+        _, raw_uid, plan, grant_id, username, signature = parts
+        uid = int(raw_uid)
+        if plan not in PLANS or not re.fullmatch(r"[A-Za-z0-9_-]{8,80}", grant_id):
+            return
+        expected = hmac.new(SYNC_SECRET.encode(), f"audit:{uid}:{plan}:{grant_id}:{username}".encode(), hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(signature, expected):
+            logger.warning("Отклонена неверная подпись payment_audit для user=%s", uid)
+            return
+        create_user_soft(uid, username if username != "-" else "")
+        now = datetime.now().isoformat()
+        _db_retry(lambda conn: conn.execute(
+            "INSERT OR IGNORE INTO payment_audits(grant_id,user_id,username,plan,status,created_at) VALUES(?,?,?,?,?,?)",
+            (grant_id, uid, "" if username == "-" else username, plan, "pending", now)
+        ))
+        await notify_owner_payment_audit(grant_id)
+    except Exception:
+        logger.exception("payment_audit handler error")
+
+
+async def monitor_payment_audits():
+    """Retry owner notifications every five minutes, up to five attempts per audit."""
+    await asyncio.sleep(20)
+    while True:
+        try:
+            rows = _db_read(lambda conn: conn.execute(
+                "SELECT grant_id FROM payment_audits WHERE status='pending' AND owner_notify_attempts < 5 "
+                "ORDER BY created_at ASC LIMIT 100"
+            ).fetchall())
+            for (grant_id,) in rows:
+                await notify_owner_payment_audit(str(grant_id))
+                await asyncio.sleep(0.25)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("monitor_payment_audits error")
+        await asyncio.sleep(300)
+
+
+@dp.callback_query(F.data.startswith("payaudit:"))
+async def callback_payment_audit(call: types.CallbackQuery):
+    if call.from_user.id != OWNER_ID:
+        return await call.answer("Эта проверка доступна только владельцу.", show_alert=True)
+    try:
+        _, decision, grant_id = call.data.split(":", 2)
+    except ValueError:
+        return await call.answer("Некорректная заявка.", show_alert=True)
+    if decision not in {"paid", "unpaid", "release"}:
+        return await call.answer("Неизвестное действие.", show_alert=True)
+    row = _db_read(lambda conn: conn.execute(
+        "SELECT user_id, username, plan, status, action_note FROM payment_audits WHERE grant_id=?", (grant_id,)
+    ).fetchone())
+    if not row:
+        return await call.answer("Заявка не найдена.", show_alert=True)
+    uid, username, plan, status, action_note = row
+    if decision == "release":
+        if status != "confirmed_unpaid":
+            return await call.answer("Для этой заявки нет активной заморозки.", show_alert=True)
+        try:
+            details = json.loads(action_note or "{}")
+        except Exception:
+            details = {}
+        if not isinstance(details, dict):
+            details = {}
+        changed = _db_retry(lambda conn: conn.execute(
+            "UPDATE payment_audits SET status='released', decided_at=?, decided_by=?, action_note=? WHERE grant_id=? AND status='confirmed_unpaid'",
+            (datetime.now().isoformat(), call.from_user.id, json.dumps(details, ensure_ascii=False), grant_id)
+        ).rowcount)
+        if not changed:
+            return await call.answer("Состояние уже изменилось.", show_alert=True)
+        await reconcile_payment_audit_holds()
+        still_held = user_payment_hold(uid)
+        result_text = ("♻️ Решение сохранено. У пользователя остаётся другая неподтверждённая оплата, поэтому заморозка сохранена."
+                       if still_held else "♻️ Заморозка снята. Сохранённые ранее работавшие боты перезапущены, если подписка активна.")
+    else:
+        if status != "pending":
+            return await call.answer("Эта заявка уже обработана.", show_alert=True)
+        new_status = "confirmed_paid" if decision == "paid" else "confirmed_unpaid"
+        frozen_ids = []
+        previously_running_ids = []
+        details = {}
+        if decision == "unpaid":
+            # No direct bot-to-subscription mapping exists yet, so keep a durable account-wide hold.
+            user_bots = _db_read(lambda conn: conn.execute("SELECT id,is_frozen FROM bots WHERE user_id=?", (uid,)).fetchall())
+            previously_frozen_ids = []
+            payment_frozen_ids = []
+            for item in user_bots:
+                bid = int(item[0])
+                was_frozen = int(item[1] or 0) == 1
+                proc = running_bots.get(bid)
+                if proc is not None and proc.poll() is None:
+                    previously_running_ids.append(bid)
+                if was_frozen:
+                    previously_frozen_ids.append(bid)
+                else:
+                    payment_frozen_ids.append(bid)
+                frozen_ids.append(bid)
+            details = {"reason": "owner_confirmed_unpaid", "frozen_bot_ids": frozen_ids,
+                       "payment_frozen_bot_ids": payment_frozen_ids,
+                       "previously_frozen_bot_ids": previously_frozen_ids,
+                       "previously_running_bot_ids": previously_running_ids}
+            action_note = json.dumps(details, ensure_ascii=False)
+        else:
+            action_note = "owner confirmed payment"
+        # Persist the exact affected bots in the same conditional update as the hold status.
+        # If the process restarts before stopping processes, monitor_bots will still enforce the hold.
+        changed = _db_retry(lambda conn: conn.execute(
+            "UPDATE payment_audits SET status=?, decided_at=?, decided_by=?, action_note=? WHERE grant_id=? AND status='pending'",
+            (new_status, datetime.now().isoformat(), call.from_user.id, action_note, grant_id)
+        ).rowcount)
+        if not changed:
+            return await call.answer("Заявка уже обработана.", show_alert=True)
+        if decision == "unpaid":
+            for bid in frozen_ids:
+                freeze_bot(bid)
+                try:
+                    await stop_user_bot(bid)
+                except Exception:
+                    logger.exception("Не удалось остановить бота #%s при заморозке оплаты", bid)
+            try:
+                await bot.send_message(uid,
+                    "⏸ <b>Доступ временно приостановлен</b>\n\n"
+                    "Владелец BotHost отметил, что оплата не поступила. Размещённые боты временно заморожены; "
+                    "файлы не удалены. Свяжись с владельцем для проверки и возможной разблокировки.",
+                    parse_mode="HTML")
+            except Exception:
+                pass
+            result_text = (f"❌ Владелец отметил оплату как не поступившую.\n"
+                           f"Пользователь <code>{uid}</code>; заморожено ботов: <b>{len(frozen_ids)}</b>.\n"
+                           "Файлы и база сохранены. Новые боты запускать/загружать нельзя до снятия заморозки.")
+        else:
+            result_text = f"✅ Оплата подтверждена владельцем для пользователя <code>{uid}</code>. Доступ оставлен активным."
+    kb = None
+    if decision == "unpaid":
+        kb = InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="♻️ Снять заморозку", callback_data=f"payaudit:release:{grant_id}")
+        ]])
+    try:
+        await call.message.edit_text((call.message.text or "Проверка оплаты") + "\n\n" + result_text,
+                                     reply_markup=kb, parse_mode="HTML")
+    except Exception:
+        pass
+    await call.answer("Решение сохранено.")
+
+
 @dp.channel_post(F.text.startswith("/service_payment_result"))
 async def channel_service_payment_result(message: types.Message):
     """Оплата доп. услуг кассира (видео/анимации).
@@ -1891,29 +2421,220 @@ async def back_main(call: types.CallbackQuery, state: FSMContext):
 # 🛡 БЕЗОПАСНАЯ РАБОТА С ZIP
 # ═══════════════════════════════════════════════════════════════
 
-MAX_UPLOAD_BYTES = 20 * 1024 * 1024
-MAX_ZIP_FILES = 500
-MAX_ZIP_UNCOMPRESSED = 100 * 1024 * 1024
+MAX_UPLOAD_BYTES = max(1, int(os.environ.get("MAX_UPLOAD_MB", "20"))) * 1024 * 1024
+MAX_PROJECT_BYTES = max(20, int(os.environ.get("MAX_PROJECT_MB", "100"))) * 1024 * 1024
+MAX_ZIP_FILES = max(10, min(5000, int(os.environ.get("MAX_ZIP_FILES", "500"))))
+MAX_ZIP_UNCOMPRESSED = max(MAX_UPLOAD_BYTES, int(os.environ.get("MAX_ZIP_UNCOMPRESSED_MB", "100")) * 1024 * 1024)
+MAX_ZIP_RATIO = max(20, min(1000, int(os.environ.get("MAX_ZIP_RATIO", "200"))))
+MAX_ZIP_DEPTH = max(3, min(30, int(os.environ.get("MAX_ZIP_DEPTH", "12"))))
+MAX_TELEGRAM_ARCHIVE_BYTES = 49 * 1024 * 1024
+# Global storage guard. Existing files are never deleted when a limit is reached.
+MAX_TOTAL_BOTS_BYTES = max(256, int(os.environ.get("MAX_TOTAL_BOTS_MB", "2048"))) * 1024 * 1024
+MIN_FREE_DISK_BYTES = max(64, int(os.environ.get("MIN_FREE_DISK_MB", "256"))) * 1024 * 1024
+ARCHIVE_EXCLUDE_DIRS = {".git", ".venv", "venv", "node_modules", "__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache"}
+ARCHIVE_EXCLUDE_FILES = {"wrapper.py", "bot.log", ".requirements.installed"}
+MAX_BOT_LOG_BYTES = max(2, int(os.environ.get("MAX_BOT_LOG_MB", "20"))) * 1024 * 1024
+BOT_LOG_KEEP_BYTES = min(2 * 1024 * 1024, max(512 * 1024, MAX_BOT_LOG_BYTES // 10))
+
+
+def safe_filename(name: str) -> str:
+    """Return a plain filename; never accept user-supplied directory components."""
+    name = str(name or "upload.bin").replace("\\\\", "/").split("/")[-1]
+    name = re.sub(r"[^A-Za-z0-9А-Яа-яЁё._() -]", "_", name).strip(" .")
+    if not name or name in {".", ".."}:
+        name = "upload.bin"
+    return name[:180]
+
+
+def directory_size(path: Path, include_runtime: bool = False) -> int:
+    """Count project payload; runtime logs/wrappers are optional for global disk accounting."""
+    total = 0
+    if not path.exists():
+        return 0
+    for root, dirs, files in os.walk(path, followlinks=False):
+        if include_runtime:
+            dirs[:] = [d for d in dirs if not Path(root, d).is_symlink()]
+        else:
+            dirs[:] = [d for d in dirs if d not in ARCHIVE_EXCLUDE_DIRS and not Path(root, d).is_symlink()]
+        for name in files:
+            if not include_runtime and name in ARCHIVE_EXCLUDE_FILES:
+                continue
+            fp = Path(root, name)
+            try:
+                if not fp.is_symlink() and fp.is_file():
+                    total += fp.stat().st_size
+            except OSError:
+                continue
+    return total
+
+
+def check_plain_file_capacity(bot_dir: Path | None, filename: str, incoming_bytes: int, check_disk: bool = True):
+    """Preflight project, host-wide storage and free-disk quotas before downloading a plain file."""
+    incoming_bytes = max(0, int(incoming_bytes or 0))
+    current_project = directory_size(bot_dir) if bot_dir and bot_dir.exists() else 0
+    target = (bot_dir / safe_filename(filename)) if bot_dir else None
+    replaced_bytes = 0
+    if target and target.is_file() and not target.is_symlink():
+        replaced_bytes = target.stat().st_size
+    resulting_project = current_project - replaced_bytes + incoming_bytes
+    if resulting_project > MAX_PROJECT_BYTES:
+        raise ValueError(f"Проект превысит лимит {MAX_PROJECT_BYTES // (1024*1024)} МБ.")
+    host_total = directory_size(BOTS_DIR, include_runtime=True)
+    if bot_dir and bot_dir.exists():
+        current_project_all = directory_size(bot_dir, include_runtime=True)
+        resulting_total = host_total - current_project_all + current_project_all - replaced_bytes + incoming_bytes
+    else:
+        resulting_total = host_total + incoming_bytes
+    if resulting_total > MAX_TOTAL_BOTS_BYTES:
+        raise ValueError(f"Общий объём проектов превысит лимит хоста {MAX_TOTAL_BOTS_BYTES // (1024*1024)} МБ.")
+    if check_disk:
+        try:
+            free_bytes = shutil.disk_usage(DATA_DIR).free
+            if free_bytes < incoming_bytes + MIN_FREE_DISK_BYTES:
+                raise ValueError(
+                    f"Недостаточно свободного места. Нужно сохранить резерв минимум "
+                    f"{MIN_FREE_DISK_BYTES // (1024*1024)} МБ на диске."
+                )
+        except OSError:
+            logger.warning("Не удалось проверить свободное место перед загрузкой.")
 
 
 def safe_extract_zip(zf: zipfile.ZipFile, destination: Path):
+    """Validate and stage a ZIP before merging it into a project.
+
+    Validation and decompression happen in a temporary sibling directory. Existing
+    project files are backed up and restored if the final merge fails, so a malformed
+    archive or a disk error cannot leave the project half-overwritten.
+    """
     infos = zf.infolist()
     if len(infos) > MAX_ZIP_FILES:
-        raise ValueError(f"В архиве слишком много файлов (максимум {MAX_ZIP_FILES}).")
+        raise ValueError(f"В архиве слишком много элементов (максимум {MAX_ZIP_FILES}).")
+    destination = Path(destination)
+    destination.mkdir(parents=True, exist_ok=True)
+    root = destination.resolve()
     total = 0
-    destination = destination.resolve()
+    seen = set()
+    checked = []
+    existing_bytes_to_replace = 0
     for info in infos:
+        raw = info.filename.replace("\\", "/")
+        parts = raw.split("/")
+        if (not raw or raw.startswith("/") or re.match(r"^[A-Za-z]:", raw)
+                or any(p in {"..", ""} for p in parts[:-1]) or parts[-1] in {"..", "."}):
+            raise ValueError("Архив содержит небезопасный путь.")
+        if len(parts) > MAX_ZIP_DEPTH:
+            raise ValueError(f"Слишком глубокая структура архива (максимум {MAX_ZIP_DEPTH} уровней).")
+        if ((info.external_attr >> 16) & 0o170000) == 0o120000:
+            raise ValueError("Символьные ссылки внутри ZIP запрещены.")
+        norm = "/".join(parts).casefold()
+        if norm in seen:
+            raise ValueError("В архиве есть повторяющиеся пути файлов.")
+        seen.add(norm)
+        if info.flag_bits & 0x1:
+            raise ValueError("Зашифрованные ZIP-архивы не поддерживаются.")
         if info.is_dir():
             continue
-        total += info.file_size
+        if Path(raw).name in ARCHIVE_EXCLUDE_FILES:
+            raise ValueError(f"Имя {Path(raw).name!r} зарезервировано хостингом и не может загружаться из архива.")
+        if info.file_size < 0 or info.compress_size < 0:
+            raise ValueError("Архив содержит некорректный размер файла.")
+        total += int(info.file_size)
         if total > MAX_ZIP_UNCOMPRESSED:
-            raise ValueError("Распакованный архив слишком большой (максимум 100 МБ).")
-        target = (destination / info.filename).resolve()
-        if not str(target).startswith(str(destination) + os.sep):
-            raise ValueError("Архив содержит небезопасный путь.")
-        target.parent.mkdir(parents=True, exist_ok=True)
-        with zf.open(info) as src_f, open(target, "wb") as dst_f:
-            shutil.copyfileobj(src_f, dst_f)
+            raise ValueError(f"Распакованный архив превышает лимит {MAX_ZIP_UNCOMPRESSED // (1024*1024)} МБ.")
+        if info.file_size > 1024 * 1024:
+            ratio = info.file_size / max(1, info.compress_size)
+            if ratio > MAX_ZIP_RATIO:
+                raise ValueError("Обнаружен подозрительный коэффициент сжатия (возможная ZIP-бомба).")
+        target = (root / raw).resolve()
+        if target == root or not target.is_relative_to(root):
+            raise ValueError("Архив пытается записать файл за пределами проекта.")
+        # Never traverse a pre-existing symlink, even if its resolved target is inside root.
+        rel = Path(raw)
+        probe = root
+        for part in rel.parts[:-1]:
+            probe = probe / part
+            if probe.exists() and probe.is_symlink():
+                raise ValueError("Запись через символическую ссылку запрещена.")
+        if target.exists():
+            if target.is_dir():
+                raise ValueError("Архив пытается заменить каталог файлом.")
+            existing_bytes_to_replace += target.stat().st_size
+        checked.append((info, rel))
+    current_project_size = directory_size(destination)
+    resulting_size = current_project_size - existing_bytes_to_replace + total
+    if resulting_size > MAX_PROJECT_BYTES:
+        raise ValueError(f"Проект превысит лимит {MAX_PROJECT_BYTES // (1024*1024)} МБ.")
+
+    # Apply a global quota only to actual bot directories, not recovery staging folders.
+    try:
+        relative_destination = destination.resolve().relative_to(BOTS_DIR.resolve())
+        is_real_bot_dir = bool(relative_destination.parts) and relative_destination.parts[0].startswith("bot_")
+    except ValueError:
+        is_real_bot_dir = False
+    if is_real_bot_dir:
+        total_now = directory_size(BOTS_DIR, include_runtime=True)
+        total_after = max(0, total_now - current_project_size + resulting_size)
+        if total_after > MAX_TOTAL_BOTS_BYTES:
+            raise ValueError(f"Общий объём проектов превысит лимит хоста {MAX_TOTAL_BOTS_BYTES // (1024*1024)} МБ.")
+
+    # Keep headroom for staging + rollback copies so a large extraction cannot fill the volume.
+    try:
+        free_bytes = shutil.disk_usage(DATA_DIR).free
+        required_free = total + existing_bytes_to_replace + MIN_FREE_DISK_BYTES
+        if free_bytes < required_free:
+            raise ValueError(
+                f"Недостаточно свободного места для безопасной распаковки. Нужно освободить примерно "
+                f"{max(1, (required_free - free_bytes) // (1024*1024) + 1)} МБ."
+            )
+    except OSError:
+        logger.warning("Не удалось определить свободное место на диске; продолжаю с ограничениями размера.")
+
+    stage = Path(tempfile.mkdtemp(prefix=".bothost-extract-", dir=str(destination.parent)))
+    rollback = Path(tempfile.mkdtemp(prefix=".bothost-rollback-", dir=str(destination.parent)))
+    moved = []
+    installed = []
+    try:
+        for info, rel in checked:
+            staged_file = stage / rel
+            staged_file.parent.mkdir(parents=True, exist_ok=True)
+            with zf.open(info) as src_f, open(staged_file, "xb") as dst_f:
+                shutil.copyfileobj(src_f, dst_f, length=1024 * 1024)
+        # Merge staged files. Back up overwritten files first; roll back on any error.
+        for info, rel in checked:
+            staged_file = stage / rel
+            target = destination / rel
+            target.parent.mkdir(parents=True, exist_ok=True)
+            parent = target.parent
+            while parent != root:
+                if parent.is_symlink():
+                    raise ValueError("Запись через символическую ссылку запрещена.")
+                parent = parent.parent
+            backup_file = rollback / rel
+            if target.exists():
+                backup_file.parent.mkdir(parents=True, exist_ok=True)
+                os.replace(target, backup_file)
+                moved.append((backup_file, target))
+            os.replace(staged_file, target)
+            installed.append(target)
+    except Exception:
+        for target in reversed(installed):
+            try:
+                if target.is_dir():
+                    shutil.rmtree(target, ignore_errors=True)
+                else:
+                    target.unlink(missing_ok=True)
+            except Exception:
+                pass
+        for backup_file, target in reversed(moved):
+            try:
+                target.parent.mkdir(parents=True, exist_ok=True)
+                os.replace(backup_file, target)
+            except Exception:
+                logger.exception("Не удалось откатить замену файла %s", target)
+        raise
+    finally:
+        shutil.rmtree(stage, ignore_errors=True)
+        shutil.rmtree(rollback, ignore_errors=True)
 
 
 def get_python_files(bot_dir: Path) -> list[str]:
@@ -2038,9 +2759,15 @@ def resolve_entry_point(bot_id: int, bot_dir: Path, stored: str):
 async def handle_files(message: types.Message, state: FSMContext):
     uid = message.from_user.id
     doc = message.document
+    if uid != OWNER_ID and user_payment_hold(uid):
+        return await message.answer(
+            "⏸ Действия с проектами временно приостановлены владельцем из-за неподтверждённой оплаты. "
+            "Напиши владельцу для проверки.")
     if (doc.file_size or 0) > MAX_UPLOAD_BYTES:
-        return await message.answer("❌ Файл слишком большой. Максимум — 20 МБ.")
-    fname = doc.file_name or "bot.zip"
+        return await message.answer(f"❌ Файл слишком большой. Максимум — {MAX_UPLOAD_BYTES // (1024*1024)} МБ.")
+    fname = safe_filename(doc.file_name or "bot.zip")
+    if fname in ARCHIVE_EXCLUDE_FILES:
+        return await message.answer("❌ Это имя файла зарезервировано BotHost. Выбери другое имя.")
     ext = fname.lower().rsplit(".", 1)[-1] if "." in fname else ""
     curr = await state.get_state()
 
@@ -2054,18 +2781,43 @@ async def handle_files(message: types.Message, state: FSMContext):
             return await message.answer("❌ Доступ запрещён.")
         bot_dir = BOTS_DIR / f"bot_{target_bid}"
         bot_dir.mkdir(parents=True, exist_ok=True)
+        if ext != "zip":
+            try:
+                check_plain_file_capacity(bot_dir, fname, int(doc.file_size or 0))
+            except ValueError as e:
+                await state.clear()
+                return await message.answer(f"❌ {html.escape(str(e))}")
         try:
             finfo = await bot.get_file(doc.file_id)
             if ext == "zip":
-                tmp = bot_dir / fname
+                tmp = DATA_DIR / f"upload_{uuid.uuid4().hex}.zip"
                 await bot.download_file(finfo.file_path, destination=tmp)
-                with zipfile.ZipFile(tmp, "r") as z:
-                    safe_extract_zip(z, bot_dir)
-                tmp.unlink(missing_ok=True)
+                try:
+                    if tmp.stat().st_size > MAX_UPLOAD_BYTES:
+                        raise ValueError(f"Файл превышает лимит {MAX_UPLOAD_BYTES // (1024*1024)} МБ.")
+                    with zipfile.ZipFile(tmp, "r") as z:
+                        await asyncio.to_thread(safe_extract_zip, z, bot_dir)
+                finally:
+                    tmp.unlink(missing_ok=True)
                 await archive_bot_files(target_bid)
                 await message.answer(f"✅ Архив распакован в бота #{target_bid}! Файлы сохранены в Telegram-хранилище.", parse_mode="HTML")
             else:
-                await bot.download_file(finfo.file_path, destination=bot_dir / fname)
+                tmp = DATA_DIR / f"upload_{uuid.uuid4().hex}_{fname}"
+                try:
+                    await bot.download_file(finfo.file_path, destination=tmp)
+                    if tmp.stat().st_size > MAX_UPLOAD_BYTES:
+                        raise ValueError(f"Файл превышает лимит {MAX_UPLOAD_BYTES // (1024*1024)} МБ.")
+                    old_size = (bot_dir / fname).stat().st_size if (bot_dir / fname).is_file() else 0
+                    if directory_size(bot_dir) - old_size + tmp.stat().st_size > MAX_PROJECT_BYTES:
+                        raise ValueError(f"Проект превысит лимит {MAX_PROJECT_BYTES // (1024*1024)} МБ.")
+                    total_disk = directory_size(BOTS_DIR, include_runtime=True)
+                    if total_disk - old_size + tmp.stat().st_size > MAX_TOTAL_BOTS_BYTES:
+                        raise ValueError(f"Общий объём проектов превысит лимит хоста {MAX_TOTAL_BOTS_BYTES // (1024*1024)} МБ.")
+                    if shutil.disk_usage(DATA_DIR).free < tmp.stat().st_size + MIN_FREE_DISK_BYTES:
+                        raise ValueError("Недостаточно свободного места на хостинге для безопасной загрузки.")
+                    os.replace(tmp, bot_dir / fname)
+                finally:
+                    tmp.unlink(missing_ok=True)
                 await archive_bot_files(target_bid)
                 await message.answer(f"✅ Файл <code>{html.escape(fname)}</code> добавлен в бота #{target_bid}! Файлы сохранены в Telegram-хранилище.", parse_mode="HTML")
         except Exception as e:
@@ -2080,6 +2832,8 @@ async def handle_files(message: types.Message, state: FSMContext):
             await message.answer("⏳ <i>Загружаю базу и привожу ботов в порядок...</i>", parse_mode="HTML")
             finfo = await bot.get_file(doc.file_id)
             await bot.download_file(finfo.file_path, destination=tmp_db)
+            if tmp_db.stat().st_size > MAX_UPLOAD_BYTES:
+                raise ValueError(f"Файл базы превышает лимит загрузки {MAX_UPLOAD_BYTES // (1024*1024)} МБ.")
             safety_name = swap_database_file(tmp_db)
 
             restored = 0
@@ -2135,7 +2889,7 @@ async def handle_files(message: types.Message, state: FSMContext):
     if ext not in ("py", "zip"):
         return await message.answer("❌ Только <b>.py</b> или <b>.zip</b>", parse_mode="HTML")
 
-    await state.update_data(file_id=doc.file_id, fname=fname, ext=ext)
+    await state.update_data(file_id=doc.file_id, fname=fname, ext=ext, file_size=int(doc.file_size or 0))
     await state.set_state(UploadStates.waiting_token)
     await message.answer(
         f"✅ <b>Файл {html.escape(fname)} получен!</b>\n\n"
@@ -2156,24 +2910,48 @@ async def handle_token(message: types.Message, state: FSMContext):
 
     data = await state.get_data()
     msg = await message.answer("⏳ <i>Распаковка проекта...</i>", parse_mode="HTML")
+    bid = None
+    bot_dir = None
     try:
+        if data["ext"] != "zip":
+            check_plain_file_capacity(None, data["fname"], int(data.get("file_size") or 0))
         ep = ""
         bid = save_bot(message.from_user.id, data["fname"], token, ep)
         bot_dir = BOTS_DIR / f"bot_{bid}"
         bot_dir.mkdir(parents=True, exist_ok=True)
 
         finfo = await bot.get_file(data["file_id"])
-        dpath = bot_dir / data["fname"]
+        staged_name = safe_filename(data["fname"])
+        dpath = DATA_DIR / f"upload_{uuid.uuid4().hex}_{staged_name}"
         await bot.download_file(finfo.file_path, destination=dpath)
+        if dpath.stat().st_size > MAX_UPLOAD_BYTES:
+            dpath.unlink(missing_ok=True)
+            raise ValueError(f"Файл превышает лимит {MAX_UPLOAD_BYTES // (1024*1024)} МБ.")
 
         if data["ext"] == "zip":
-            with zipfile.ZipFile(dpath, "r") as z:
-                safe_extract_zip(z, bot_dir)
-            dpath.unlink(missing_ok=True)
+            try:
+                with zipfile.ZipFile(dpath, "r") as z:
+                    await asyncio.to_thread(safe_extract_zip, z, bot_dir)
+            finally:
+                dpath.unlink(missing_ok=True)
         else:
-            target = bot_dir / data["fname"]
-            if dpath != target:
-                dpath.replace(target)
+            if directory_size(bot_dir) + dpath.stat().st_size > MAX_PROJECT_BYTES:
+                dpath.unlink(missing_ok=True)
+                shutil.rmtree(bot_dir, ignore_errors=True)
+                _db_retry(lambda conn: conn.execute("DELETE FROM bots WHERE id=?", (bid,)))
+                raise ValueError(f"Проект превысит лимит {MAX_PROJECT_BYTES // (1024*1024)} МБ.")
+            if directory_size(BOTS_DIR, include_runtime=True) + dpath.stat().st_size > MAX_TOTAL_BOTS_BYTES:
+                dpath.unlink(missing_ok=True)
+                shutil.rmtree(bot_dir, ignore_errors=True)
+                _db_retry(lambda conn: conn.execute("DELETE FROM bots WHERE id=?", (bid,)))
+                raise ValueError(f"Общий объём проектов превысит лимит хоста {MAX_TOTAL_BOTS_BYTES // (1024*1024)} МБ.")
+            if shutil.disk_usage(DATA_DIR).free < dpath.stat().st_size + MIN_FREE_DISK_BYTES:
+                dpath.unlink(missing_ok=True)
+                shutil.rmtree(bot_dir, ignore_errors=True)
+                _db_retry(lambda conn: conn.execute("DELETE FROM bots WHERE id=?", (bid,)))
+                raise ValueError("Недостаточно свободного места на хостинге для безопасной загрузки.")
+            target = bot_dir / staged_name
+            os.replace(dpath, target)
 
         ep = find_entry_point(bot_dir)
         update_bot_entry(bid, ep)
@@ -2203,7 +2981,14 @@ async def handle_token(message: types.Message, state: FSMContext):
                 ]),
                 parse_mode="HTML")
     except Exception as e:
-        await msg.edit_text(f"❌ Ошибка: {e}")
+        if bid is not None:
+            try:
+                if bot_dir and bot_dir.exists():
+                    shutil.rmtree(bot_dir, ignore_errors=True)
+                _db_retry(lambda conn: conn.execute("DELETE FROM bots WHERE id=?", (bid,)))
+            except Exception:
+                logger.exception("Не удалось очистить неудачный новый проект #%s", bid)
+        await msg.edit_text(f"❌ Ошибка загрузки проекта: {html.escape(str(e)[:300])}")
     await state.clear()
 
 
@@ -4152,9 +4937,33 @@ async def cb_adm_backup(call: types.CallbackQuery):
     if call.from_user.id != OWNER_ID:
         return await call.answer("Только владелец", show_alert=True)
     if DB_PATH.exists():
-        await call.message.answer_document(
-            FSInputFile(str(DB_PATH), filename=f"backup_{datetime.now().strftime('%Y%m%d_%H%M')}.db"))
-        await call.answer("✅")
+        snapshot = DATA_DIR / f"backup_{uuid.uuid4().hex}.db"
+        source = target = None
+        try:
+            source = sqlite3.connect(DB_PATH, timeout=15)
+            target = sqlite3.connect(snapshot, timeout=15)
+            source.execute("PRAGMA busy_timeout=15000")
+            source.backup(target)
+            target.commit()
+            check = target.execute("PRAGMA integrity_check").fetchone()
+            if not check or check[0] != "ok":
+                raise RuntimeError("Резервная копия не прошла integrity_check.")
+            target.close()
+            target = None
+            source.close()
+            source = None
+            await call.message.answer_document(
+                FSInputFile(str(snapshot), filename=f"backup_{datetime.now().strftime('%Y%m%d_%H%M')}.db"))
+            await call.answer("✅ Резервная копия проверена")
+        except Exception as e:
+            logger.exception("Не удалось создать резервную копию БД")
+            await call.answer("Не удалось создать резервную копию", show_alert=True)
+        finally:
+            if target:
+                target.close()
+            if source:
+                source.close()
+            snapshot.unlink(missing_ok=True)
     else:
         await call.answer("БД нет", show_alert=True)
 
@@ -4201,18 +5010,29 @@ async def main():
     if str(DATA_DIR).startswith("/app") and os.name == "posix":
         logger.info("💡 Важно: подключи Railway Volume на %s — иначе подписки и боты исчезнут при редеплое.", DATA_DIR)
 
-    # Сброс webhook, иначе Conflict forever
+    # Удаляем webhook, но НЕ выбрасываем очередь: в ней могут быть подписанные события оплаты от кассира.
     try:
-        await bot.delete_webhook(drop_pending_updates=True)
-        logger.info("✅ Webhook удалён, polling готов")
+        await bot.delete_webhook(drop_pending_updates=False)
+        logger.info("✅ Webhook удалён без сброса очереди обновлений, polling готов")
     except Exception as e:
         logger.warning(f"delete_webhook: {e}")
 
-    await bootstrap_bot_archives()
-    await restore_running_bots()
-    asyncio.create_task(monitor_bots())
-    asyncio.create_task(auto_backup())
-    asyncio.create_task(monitor_subscriptions())
+    async def startup_recovery():
+        try:
+            await reconcile_payment_audit_holds()
+            started, skipped = await restore_running_bots()
+            logger.info("♻️ Восстановление ботов завершено: запущено=%s, пропущено=%s", started, skipped)
+            await bootstrap_bot_archives()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Ошибка фонового восстановления/архивации ботов")
+
+    startup_task = asyncio.create_task(startup_recovery(), name="startup-recovery")
+    monitor_task = asyncio.create_task(monitor_bots(), name="monitor-bots")
+    backup_task = asyncio.create_task(auto_backup(), name="auto-backup")
+    subscriptions_task = asyncio.create_task(monitor_subscriptions(), name="monitor-subscriptions")
+    payment_audit_task = asyncio.create_task(monitor_payment_audits(), name="monitor-payment-audits")
 
     # Кассир должен работать РОВНО в одном месте, поэтому перед запуском внутреннего
     # кассира проверяем, не опрашивает ли его токен кто-то ещё.
@@ -4282,12 +5102,17 @@ async def main():
                 logger.exception("❌ Основной BotHost polling упал; перезапуск через 5 сек")
                 await asyncio.sleep(5)
     finally:
-        if cashier_task:
-            cashier_task.cancel()
-            try:
-                await cashier_task
-            except asyncio.CancelledError:
-                pass
+        for task in (cashier_task, startup_task, monitor_task, backup_task, subscriptions_task):
+            if task:
+                task.cancel()
+        for task in (cashier_task, startup_task, monitor_task, backup_task, subscriptions_task):
+            if task:
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+                except Exception:
+                    logger.exception("Ошибка при завершении фоновой задачи %s", task.get_name())
 
 
 if __name__ == "__main__":
