@@ -4522,7 +4522,7 @@ async def cb_adm_promo_del(call: types.CallbackQuery):
 @dp.callback_query(F.data == "adm_allbots")
 async def cb_adm_allbots(call: types.CallbackQuery):
     if not is_admin(call.from_user.id):
-        return
+        return await call.answer("🔐 Нет прав", show_alert=True)
     bots = get_all_bots()
     kb = []
     for b in bots[-30:]:
@@ -4531,10 +4531,23 @@ async def cb_adm_allbots(call: types.CallbackQuery):
             text=f"{st} #{b[0]} u:{b[1]} {(b[2] or '')[:12]}",
             callback_data=f"bot:{b[0]}")])
     kb.append([InlineKeyboardButton(text="« Админка", callback_data="admin")])
-    await call.message.edit_text(
-        "🤖 <b>Все боты (God Mode)</b>",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=kb),
-        parse_mode="HTML")
+    
+    text = "🤖 <b>Все боты (God Mode)</b>"
+    markup = InlineKeyboardMarkup(inline_keyboard=kb)
+    
+    try:
+        await call.message.edit_text(
+            text,
+            reply_markup=markup,
+            parse_mode="HTML"
+        )
+    except TelegramBadRequest as e:
+        if "message is not modified" in str(e).lower():
+            await call.answer("Данные уже актуальны")
+            return
+        raise
+    
+    await call.answer()
 
 
 @dp.callback_query(F.data.startswith("adm_viewuser_id:"))
