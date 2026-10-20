@@ -1,5 +1,5 @@
 """
-🤖 BotHost v9.8 — Subscriptions Edition
+🤖 BotHost v9.9 — Resource Guard Edition
 ────────────────────────────────────────────────────────────────
 Что изменилось по сравнению с v8.0:
 
@@ -1558,7 +1558,7 @@ async def monitor_bots():
                                 pass
         except Exception:
             logger.exception("monitor_bots error")
-        await asyncio.sleep(20)
+        await asyncio.sleep(max(3, min(10, int(os.environ.get("BOT_MONITOR_INTERVAL", "5")))))
 
 
 async def monitor_subscriptions():
@@ -1636,7 +1636,14 @@ async def bootstrap_bot_archives():
     for b in get_all_bots():
         exists = _db_read(lambda conn, bid=b[0]: conn.execute("SELECT 1 FROM bot_archives WHERE bot_id=? LIMIT 1", (bid,)).fetchone())
         if not exists and get_python_files(BOTS_DIR / f"bot_{b[0]}"):
-            await archive_bot_files(b[0])
+            try:
+                await archive_bot_files(b[0])
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("Не удалось создать стартовый архив бота #%s", b[0])
+            # Archive creation is CPU/disk intensive; don't compress many projects back-to-back.
+            await asyncio.sleep(max(1, min(10, int(os.environ.get("ARCHIVE_COOLDOWN_SECONDS", "2")))))
 
 
 async def reconcile_payment_audit_holds():
@@ -1829,7 +1836,14 @@ async def auto_backup():
                 finally:
                     snapshot.unlink(missing_ok=True)
             for b in get_all_bots():
-                await archive_bot_files(b[0])
+                try:
+                    await archive_bot_files(b[0])
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    logger.exception("Ошибка архивации бота #%s в резервном цикле", b[0])
+                # Avoid a CPU/disk spike when many user bots are hosted together.
+                await asyncio.sleep(max(1, min(10, int(os.environ.get("ARCHIVE_COOLDOWN_SECONDS", "2")))))
             removed = cleanup_subscriptions(60)
             if removed:
                 logger.info("🧹 Удалено старых подписок: %s", removed)
@@ -2433,7 +2447,7 @@ MAX_TOTAL_BOTS_BYTES = max(256, int(os.environ.get("MAX_TOTAL_BOTS_MB", "2048"))
 MIN_FREE_DISK_BYTES = max(64, int(os.environ.get("MIN_FREE_DISK_MB", "256"))) * 1024 * 1024
 ARCHIVE_EXCLUDE_DIRS = {".git", ".venv", "venv", "node_modules", "__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache"}
 ARCHIVE_EXCLUDE_FILES = {"wrapper.py", "bot.log", ".requirements.installed"}
-MAX_BOT_LOG_BYTES = max(2, int(os.environ.get("MAX_BOT_LOG_MB", "20"))) * 1024 * 1024
+MAX_BOT_LOG_BYTES = max(2, min(64, int(os.environ.get("MAX_BOT_LOG_MB", "8")))) * 1024 * 1024
 BOT_LOG_KEEP_BYTES = min(2 * 1024 * 1024, max(512 * 1024, MAX_BOT_LOG_BYTES // 10))
 
 
