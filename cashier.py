@@ -155,6 +155,42 @@ def load_plans():
 
 
 PLANS = load_plans()
+
+# Заказы из отдельного бота заказов используют тот же канал синхронизации, но
+# их PLAN может отличаться от тарифов BotHost. Описания задаются в Railway:
+# CASHIER_ORDER_PLANS_JSON={"PLAN1":{"name":"Заказ","stars":15,"days":1,"kind":"bot","emoji":"💳"}}
+ORDER_PLAN_IDS = set()
+
+def load_order_plans():
+    raw = os.environ.get("CASHIER_ORDER_PLANS_JSON", "").strip()
+    if not raw:
+        return
+    try:
+        configured = json.loads(raw)
+        if not isinstance(configured, dict):
+            raise ValueError("ожидался JSON-объект")
+        for key, cfg in configured.items():
+            key = str(key).strip()
+            if not re.fullmatch(r"[A-Za-z0-9_-]{1,40}", key) or not isinstance(cfg, dict):
+                log.warning("CASHIER_ORDER_PLANS_JSON: пропускаю некорректный тариф %r", key)
+                continue
+            stars = int(cfg.get("stars", 0))
+            if stars < 1 or stars > 100000:
+                log.warning("CASHIER_ORDER_PLANS_JSON: для %s нужна цена stars > 0", key)
+                continue
+            PLANS[key] = {
+                "name": str(cfg.get("name", f"Оплата заказа {key}"))[:80],
+                "stars": stars,
+                "days": max(1, int(cfg.get("days", 1))),
+                "kind": str(cfg.get("kind", "bot")),
+                "emoji": str(cfg.get("emoji", "💳"))[:8],
+            }
+            ORDER_PLAN_IDS.add(key)
+    except Exception as exc:
+        log.error("Не удалось прочитать CASHIER_ORDER_PLANS_JSON: %s", type(exc).__name__)
+
+load_order_plans()
+
 PAID_SERVICE_PLANS = {"video": {"name": "🎬 Видео", "stars": 15, "uses": 5},
                       "animation": {"name": "✨ Анимации", "stars": 15, "uses": 5}}
 TIMEZONES = {"tz_msk": {"name": "🇷🇺 Москва / Минск · UTC+3", "offset": 3},
@@ -444,7 +480,16 @@ async def request_from_user(uid, plan_id):
 
 
 async def finish_result(uid, plan_id, result, grant_id):
-    return await send_channel(f"/payment_result {uid} {plan_id} {result} {grant_id} {sign('result', uid, plan_id, result, grant_id)}")
+    # Bot заказа проверяет подпись в legacy-формате HMAC(uid:plan:status:grant_id),
+    # тогда как BotHost использует HMAC("result:uid:plan:status:grant_id").
+    # Для отдельно настроенных order-планов отправляем формат, который ожидает
+    # существующий бот заказов; его исходный код менять не требуется.
+    if plan_id in ORDER_PLAN_IDS:
+        raw = f"{uid}:{plan_id}:{str(result).upper()}:{grant_id}".encode()
+        signature = hmac.new(SYNC_SECRET.encode(), raw, hashlib.sha256).hexdigest()
+    else:
+        signature = sign("result", uid, plan_id, result, grant_id)
+    return await send_channel(f"/payment_result {uid} {plan_id} {result} {grant_id} {signature}")
 
 
 async def finish_audit(uid, plan_id, grant_id, username="-"):
@@ -489,9 +534,53 @@ async def finish_service_result(uid, service_key, result, grant_id, request_id="
 async def sync_channel_post(message: types.Message):
     text = message.text or ""
 
-    # ── Заявка на тариф от BotHost: /payment_request UID PLAN USERNAME SIGNATURE ──
+    # ── Заявки от BotHost и отдельного бота заказов ──
     if text.startswith("/payment_request"):
         parts = text.split()
+        order_request = any(line.startswith("ORDER_ID=") for line in text.splitlines()[1:])
+        if order_request:
+            # Формат бота заказов: /payment_request UID PLAN ORDER_NUMBER + ORDER_ID=...
+            # Принимаем его только из выделенного sync-канала; PLAN должен быть
+            # описан в PLANS или CASHIER_ORDER_PLANS_JSON.
+            if len(parts) < 4 or not SYNC_SECRET:
+                log.warning("order payment_request: некорректный запрос или не задан SYNC_SECRET")
+                return
+            try:
+                uid = int(parts[1])
+                plan = parts[2].strip()
+                order_id = int(next(line.split("=", 1)[1] for line in text.splitlines()
+                                    if line.startswith("ORDER_ID=")))
+            except (ValueError, StopIteration):
+                log.warning("order payment_request: некорректные поля")
+                return
+            if plan not in PLANS:
+                log.error("Заказ %s: тариф %r не настроен в CASHIER_ORDER_PLANS_JSON", order_id, plan)
+                try:
+                    await bot.send_message(OWNER_ID,
+                        f"⚠️ <b>Не настроен тариф для оплаты заказа</b>\nЗаказ: <code>{order_id}</code>\n"
+                        f"PLAN: <code>{html.escape(plan)}</code>\nДобавь его в CASHIER_ORDER_PLANS_JSON.",
+                        parse_mode="HTML")
+                    await bot.send_message(uid,
+                        "⚠️ Кассир получил заказ, но тариф для него не настроен. Владелец уже уведомлён; пока не отправляй подарок.",
+                        parse_mode="HTML")
+                except Exception:
+                    pass
+                return
+            p = PLANS[plan]
+            kb = InlineKeyboardMarkup(inline_keyboard=[[
+                InlineKeyboardButton(text=f"💳 Оплатить заказ #{order_id} · {p['stars']}⭐",
+                                     callback_data=f"plan:{plan}")
+            ]])
+            try:
+                await bot.send_message(uid,
+                    f"💳 <b>Оплата заказа #{order_id}</b>\n\n{p['emoji']} <b>{html.escape(p['name'])}</b> · "
+                    f"<b>{p['stars']}⭐</b>\n\nНажми кнопку ниже и отправь скриншоты для проверки.",
+                    reply_markup=kb, parse_mode="HTML")
+            except Exception as exc:
+                log.error("order payment user notify: %s", type(exc).__name__)
+            return
+
+        # Стандартная заявка BotHost обязана иметь HMAC-подпись.
         if len(parts) < 5:
             log.warning("payment_request: мало полей (%s)", text[:120])
             return
@@ -505,7 +594,6 @@ async def sync_channel_post(message: types.Message):
         if plan not in PLANS:
             log.warning("payment_request: неизвестный тариф %r — он должен быть и в BotHost, и здесь", plan)
             return
-        # Подпись обязательна: без неё заявку мог бы подделать любой, кто пишет в канал.
         if not SYNC_SECRET:
             log.error("payment_request: SYNC_SECRET не задан — заявка отклонена")
             return
