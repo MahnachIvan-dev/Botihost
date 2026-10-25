@@ -1,8 +1,22 @@
 FROM python:3.12-slim
-ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 PIP_NO_CACHE_DIR=1
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1
+
 WORKDIR /app
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
-COPY bot.py .
-COPY cashier.py .
+
+# Install dependencies in a separate layer for reliable caching.
+COPY requirements.txt ./requirements.txt
+RUN python -m pip install --upgrade pip setuptools wheel \
+    && python -m pip install --no-cache-dir --prefer-binary -r requirements.txt
+
+# Both bots must be present because cashier.py is imported by bot.py.
+COPY bot.py ./bot.py
+COPY cashier.py ./cashier.py
+
+RUN mkdir -p /app/data /app/data/bots \
+    && python -m py_compile /app/bot.py /app/cashier.py
+
 CMD ["python", "-u", "bot.py"]

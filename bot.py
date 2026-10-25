@@ -123,7 +123,7 @@ elif _cashier_env in ("0", "false", "no", "off", "выкл"):
 else:
     INTERNAL_CASHIER_MODE = "auto"
 INTERNAL_CASHIER = INTERNAL_CASHIER_MODE  # для обратной совместимости и логов
-BOTHOST_VERSION = "9.8"
+BOTHOST_VERSION = "9.9"
 
 DATA_DIR = Path(os.environ.get("DATA_DIR", "/app/data"))
 BOTS_DIR = DATA_DIR / "bots"
@@ -232,7 +232,7 @@ bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
 running_bots: Dict[int, subprocess.Popen] = {}
 start_locks: Dict[int, asyncio.Lock] = {}
-MAX_PARALLEL_STARTS = max(1, min(4, int(os.environ.get("MAX_PARALLEL_STARTS", "2"))))
+MAX_PARALLEL_STARTS = max(1, min(4, int(os.environ.get("MAX_PARALLEL_STARTS", "1"))))
 start_semaphore = asyncio.Semaphore(MAX_PARALLEL_STARTS)
 archive_semaphore = asyncio.Semaphore(1)
 restart_history: Dict[int, list] = {}
