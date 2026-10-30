@@ -1805,7 +1805,9 @@ async def cashier_token_is_free(token):
     except TelegramUnauthorizedError:
         return False, "токен недействителен (проверь CASHIER_TOKEN у @BotFather)"
     except Exception as e:
-        return False, f"не удалось проверить токен ({type(e).__name__}: {e})"
+        # Временная ошибка сети не должна навсегда блокировать запуск кассира.
+        # Фактический конфликт будет обработан самим polling в run_internal_cashier().
+        return True, f"предварительная проверка недоступна ({type(e).__name__}); запуск polling с обработкой конфликтов"
 
 
 async def apply_restored_state():
