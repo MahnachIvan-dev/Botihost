@@ -1790,22 +1790,22 @@ def note_startup_time():
 
 
 async def cashier_token_is_free(token):
-    """Проверяет, не опрашивает ли этот токен кто-то ещё прямо сейчас.
+    """Безопасно проверяет токен кассира, не запуская getUpdates.
 
-    Telegram отвечает 409 Conflict, если параллельно уже работает другой getUpdates.
-    Так мы ловим забытый второй сервис кассира ДО того, как начнём конфликтовать.
-    Возвращает (свободен, пояснение).
+    Нельзя надёжно проверить занятость polling-токена отдельным getUpdates:
+    сам тест может конкурировать с работающим кассиром и затронуть очередь обновлений.
+    get_me() только проверяет токен и не запускает polling.
     """
     try:
         async with Bot(token=token) as probe:
-            await probe.get_updates(offset=-1, timeout=0, limit=1)
-        return True, "свободен"
-    except TelegramConflictError:
-        return False, "токен уже опрашивает другой процесс"
+            me = await probe.get_me()
+        if not me or not me.is_bot:
+            return False, "токен не принадлежит боту"
+        return True, f"токен действителен (@{me.username or 'без_username'})"
     except TelegramUnauthorizedError:
         return False, "токен недействителен (проверь CASHIER_TOKEN у @BotFather)"
     except Exception as e:
-        return True, f"проверить не удалось ({e})"
+        return False, f"не удалось проверить токен ({type(e).__name__}: {e})"
 
 
 async def apply_restored_state():
@@ -5085,15 +5085,27 @@ async def main():
                             cashier = importlib.import_module("cashier")
                             logger.info("💳 Внутренний кассир запускается в том же сервисе...")
                             await cashier.main()
-                            logger.warning("⚠️ Кассир завершил polling без исключения; перезапуск через 3 сек")
+                            logger.warning("⚠️ Кассир завершил polling без исключения; перезапуск через 10 сек")
                         except asyncio.CancelledError:
                             raise
+                        except TelegramConflictError:
+                            # Не перезапускаем polling бесконечно: это создаёт лишние запросы и шум в логах.
+                            # Конфликт означает, что тот же CASHIER_TOKEN уже используется другим polling-процессом.
+                            logger.exception(
+                                "❌ Кассир остановлен из-за TelegramConflictError. "
+                                "Останови второй процесс/сервис с CASHIER_TOKEN; "
+                                "после исправления перезапусти BotHost."
+                            )
+                            return
+                        except TelegramUnauthorizedError:
+                            logger.exception("❌ Кассир остановлен: CASHIER_TOKEN недействителен.")
+                            return
                         except Exception:
-                            logger.exception("❌ Внутренний кассир остановился; перезапуск через 5 сек")
-                        await asyncio.sleep(5)
+                            logger.exception("❌ Внутренний кассир остановился; повтор через 10 сек")
+                        await asyncio.sleep(10)
 
                 cashier_task = asyncio.create_task(run_internal_cashier(), name="internal-cashier")
-                logger.info("✅ Токен кассира свободен (%s) — внутренний кассир стартует", why)
+                logger.info("✅ Токен кассира проверен (%s) — внутренний кассир стартует. Проверка не опрашивает getUpdates.", why)
     elif want_internal and not cashier_token_present:
         logger.warning("⚠️ Внутренний кассир не запущен: нет CASHIER_TOKEN. "
                        "Оплата пойдёт через отдельный сервис кассира, если он есть.")
