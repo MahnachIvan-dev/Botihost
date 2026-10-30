@@ -15,8 +15,9 @@ RUN python -m pip install --upgrade pip setuptools wheel \
 # Both bots must be present because cashier.py is imported by bot.py.
 COPY bot.py ./bot.py
 COPY cashier.py ./cashier.py
+COPY sitecustomize.py ./sitecustomize.py
 
 RUN mkdir -p /app/data /app/data/bots \
-    && python -m py_compile /app/bot.py /app/cashier.py
+    && python -m py_compile /app/sitecustomize.py /app/bot.py /app/cashier.py
 
 CMD ["python", "-u", "bot.py"]
