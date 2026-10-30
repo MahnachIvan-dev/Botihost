@@ -5143,10 +5143,10 @@ async def main():
                 logger.exception("❌ Основной BotHost polling упал; перезапуск через 5 сек")
                 await asyncio.sleep(5)
     finally:
-        for task in (cashier_task, startup_task, monitor_task, backup_task, subscriptions_task):
+        for task in (cashier_task, startup_task, monitor_task, backup_task, subscriptions_task, payment_audit_task):
             if task:
                 task.cancel()
-        for task in (cashier_task, startup_task, monitor_task, backup_task, subscriptions_task):
+        for task in (cashier_task, startup_task, monitor_task, backup_task, subscriptions_task, payment_audit_task):
             if task:
                 try:
                     await task
